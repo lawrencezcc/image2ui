@@ -34,19 +34,58 @@ function shouldUseVerticalText(node: SceneNode) {
     return false
   }
 
+  if (node.text.direction === 'vertical') {
+    return true
+  }
+
   const compactText = node.text.content.replace(/\s+/g, '')
   const isMostlyCjk = [...compactText].every((char) => /[\u3040-\u30ff\u3400-\u9fff]/.test(char))
   return isMostlyCjk && node.frame.height >= node.frame.width * 2.4
 }
 
+function textTransform(node: SceneNode) {
+  if (node.text?.direction === 'rotate-ccw') {
+    return 'rotate(-90deg)'
+  }
+
+  if (node.text?.direction === 'rotate-cw') {
+    return 'rotate(90deg)'
+  }
+
+  return undefined
+}
+
+function layoutFrame(node: SceneNode) {
+  const transform = textTransform(node)
+  if (!transform || !node.text) {
+    return node.frame
+  }
+
+  const width = node.text.box.width
+  const height = node.text.box.height
+  return {
+    ...node.frame,
+    x: node.frame.x + (node.frame.width - width) / 2,
+    y: node.frame.y + (node.frame.height - height) / 2,
+    width,
+    height,
+  }
+}
+
+function hasCanvasNodes(scene: SceneDocument) {
+  return scene.nodes.some((node) => node.render === 'canvas' && node.canvas)
+}
+
 function renderNode(node: SceneNode) {
   const useVerticalText = shouldUseVerticalText(node)
+  const transform = textTransform(node)
+  const frame = layoutFrame(node)
   const baseStyle = styleToString({
     position: 'absolute',
-    left: `${node.frame.x}px`,
-    top: `${node.frame.y}px`,
-    width: `${node.frame.width}px`,
-    height: `${node.frame.height}px`,
+    left: `${frame.x}px`,
+    top: `${frame.y}px`,
+    width: `${frame.width}px`,
+    height: `${frame.height}px`,
     'z-index': node.zIndex,
     opacity: node.opacity ?? 1,
     overflow: node.clip?.enabled ? 'hidden' : 'visible',
@@ -62,12 +101,21 @@ function renderNode(node: SceneNode) {
     'writing-mode': useVerticalText ? 'vertical-rl' : undefined,
     'text-orientation': useVerticalText ? 'mixed' : undefined,
     'text-align': node.text?.align,
+    display: transform ? 'flex' : undefined,
+    'align-items': transform ? 'center' : undefined,
+    'justify-content': transform ? 'center' : undefined,
+    transform,
+    'transform-origin': transform ? 'center center' : undefined,
   })
+
+  if (node.render === 'canvas' && node.canvas) {
+    return `<canvas data-node-id="${node.id}" :ref="setCanvasRef('${node.id}')" width="${Math.max(1, Math.round(frame.width))}" height="${Math.max(1, Math.round(frame.height))}" style="${baseStyle}"></canvas>`
+  }
 
   if (node.render === 'svg' && node.type === 'ellipse') {
     return `
-      <svg data-node-id="${node.id}" viewBox="0 0 ${node.frame.width} ${node.frame.height}" style="${baseStyle}">
-        <ellipse cx="${node.frame.width / 2}" cy="${node.frame.height / 2}" rx="${node.frame.width / 2}" ry="${node.frame.height / 2}" fill="${nodeFill(node)}" />
+      <svg data-node-id="${node.id}" viewBox="0 0 ${frame.width} ${frame.height}" style="${baseStyle}">
+        <ellipse cx="${frame.width / 2}" cy="${frame.height / 2}" rx="${frame.width / 2}" ry="${frame.height / 2}" fill="${nodeFill(node)}" />
       </svg>
     `.trim()
   }
@@ -92,8 +140,31 @@ export function buildFallbackComponent(scene: SceneDocument) {
     .sort((left, right) => left.zIndex - right.zIndex)
     .map((node) => renderNode(node))
     .join('\n')
+  const canvasNodes = scene.nodes.filter((node) => node.render === 'canvas' && node.canvas)
+  const canvasSpecsLiteral = JSON.stringify(
+    Object.fromEntries(canvasNodes.map((node) => [node.id, node.canvas])),
+    null,
+    2,
+  )
+  const scriptBlock = hasCanvasNodes(scene)
+    ? `
+<script setup>
+import { onMounted } from 'vue'
+import { createCanvasBindings } from '../canvas-runtime'
+
+const canvasSpecs = ${canvasSpecsLiteral}
+const { setCanvasRef, drawAll } = createCanvasBindings()
+
+onMounted(() => {
+  drawAll(canvasSpecs)
+})
+</script>
+    `.trim()
+    : ''
 
   return `
+${scriptBlock}
+
 <template>
   <div
     data-artboard-root="true"

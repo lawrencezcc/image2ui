@@ -38,11 +38,25 @@ type TaskTimelineItem = {
   activeStepLabel?: string
   bestStageIndex: number
   finalStageIndex: number
+  comparisonGroupId?: string
+  comparisonGroupLabel?: string
+  caseId?: string
+  caseLabel?: string
+  versionLabel?: string
+  versionTag?: string
+  branchKind?: 'dom-svg' | 'canvas' | 'adhoc'
   stages: StageTimelineItem[]
 }
 
 type TimelineDocument = {
   version: string
+  tasks: TaskTimelineItem[]
+}
+
+type TaskGroup = {
+  key: string
+  label: string
+  caseLabel?: string
   tasks: TaskTimelineItem[]
 }
 
@@ -57,7 +71,71 @@ const expandedTaskIds = ref<string[]>([])
 
 let refreshHandle: number | undefined
 
-const tasks = computed(() => [...timeline.value.tasks].reverse())
+const tasks = computed(() => {
+  const deduped = new Map<string, TaskTimelineItem>()
+
+  for (const task of timeline.value.tasks) {
+    const existing = deduped.get(task.taskId)
+    if (!existing) {
+      deduped.set(task.taskId, task)
+      continue
+    }
+
+    const existingScore = existing.comparisonGroupId ? 1 : 0
+    const currentScore = task.comparisonGroupId ? 1 : 0
+    if (currentScore >= existingScore) {
+      deduped.set(task.taskId, task)
+    }
+  }
+
+  return [...deduped.values()].reverse()
+})
+
+function versionOrder(task: TaskTimelineItem) {
+  const label = (task.versionLabel ?? '').toLowerCase()
+  if (label.includes('baseline') || label.includes('旧')) {
+    return 0
+  }
+
+  if (task.branchKind === 'canvas' || label.includes('canvas')) {
+    return 2
+  }
+
+  return 1
+}
+
+const taskGroups = computed<TaskGroup[]>(() => {
+  const groups = new Map<string, TaskGroup>()
+
+  for (const task of tasks.value) {
+    const key = task.comparisonGroupId ?? `task:${task.taskId}`
+    const existing = groups.get(key)
+
+    if (existing) {
+      existing.tasks.push(task)
+      continue
+    }
+
+    groups.set(key, {
+      key,
+      label: task.comparisonGroupLabel ?? task.caseLabel ?? task.taskId,
+      caseLabel: task.caseLabel,
+      tasks: [task],
+    })
+  }
+
+  return [...groups.values()].map((group) => ({
+    ...group,
+    tasks: [...group.tasks].sort((left, right) => {
+      const versionDelta = versionOrder(left) - versionOrder(right)
+      if (versionDelta !== 0) {
+        return versionDelta
+      }
+
+      return new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime()
+    }),
+  }))
+})
 
 function ensureExpandedTaskState() {
   const known = new Set(expandedTaskIds.value)
@@ -186,88 +264,105 @@ watch(tasks, () => {
     </section>
 
     <section v-else class="task-grid">
-      <article v-for="task in tasks" :key="task.taskId" class="task-row">
-        <button class="task-toggle" type="button" @click="toggleTask(task.taskId)">
-          <aside class="task-meta">
-            <p class="task-id">{{ task.taskId }}</p>
-            <p class="task-time">{{ new Date(task.createdAt).toLocaleString() }}</p>
-            <p class="task-exit">
-              {{ task.status === 'running' ? `进行中：${task.activeStepLabel ?? '处理中'}` : `退出：${task.exitReason}` }}
-            </p>
-            <p class="task-best">最佳阶段：{{ task.bestStageIndex || '--' }}</p>
-          </aside>
+      <article v-for="group in taskGroups" :key="group.key" class="task-group">
+        <header class="group-header">
+          <div>
+            <p class="group-eyebrow">Comparison Group</p>
+            <h2>{{ group.label }}</h2>
+          </div>
+          <span class="group-count">{{ group.tasks.length }} 个版本</span>
+        </header>
 
-          <span class="task-toggle-indicator">
-            {{ isExpanded(task.taskId) ? '收起' : '展开' }}
-          </span>
-        </button>
-
-        <div v-if="isExpanded(task.taskId)" class="stage-strip">
-          <figure class="stage-card source-card">
-            <img :src="`/${task.inputImage}`" alt="source reference" loading="lazy" />
-            <figcaption>
-              <strong>原图</strong>
-              <span>输入设计图</span>
-            </figcaption>
-          </figure>
-
-          <figure
-            v-if="task.status === 'running' && !task.stages.length"
-            class="stage-card stage-card--running"
-          >
-            <div class="stage-placeholder" aria-hidden="true">
-              <div class="stage-placeholder-bar"></div>
-              <div class="stage-placeholder-bar stage-placeholder-bar--short"></div>
-              <div class="stage-placeholder-grid">
-                <span v-for="index in 6" :key="index" class="stage-placeholder-dot"></span>
-              </div>
-            </div>
-            <figcaption>
-              <strong>准备中</strong>
-              <span>{{ task.activeStepLabel ?? '正在解析设计图结构…' }}</span>
-              <small>阶段占位会在首个截图完成后即时替换。</small>
-            </figcaption>
-          </figure>
-
-          <figure
-            v-for="stage in task.stages"
-            :key="`${task.taskId}-${stage.index}`"
-            class="stage-card"
-            :class="{ 'stage-card--running': stage.status === 'running' }"
-          >
-            <template v-if="stage.status === 'completed' && stage.screenshot">
-              <img :src="`/${stage.screenshot}`" :alt="`${stage.name} screenshot`" loading="lazy" />
-              <figcaption>
-                <strong>{{ stage.index }} · {{ stage.name }}</strong>
-                <span>{{ stage.deltaSummary }}</span>
-                <small>
-                  相似度 {{ formatRate(stage.metrics?.visualSimilarity) }} ·
-                  遵从率 {{ formatRate(stage.debug?.overallAdherenceRate) }}
-                </small>
-                <small>{{ formatRenderMode(stage) }}</small>
-                <small>
-                  溢出 {{ stage.metrics?.overflowCount ?? '--' }} · 遮挡
-                  {{ stage.metrics?.occlusionCount ?? '--' }} · 严重问题
-                  {{ stage.metrics?.criticalIssueCount ?? '--' }}
-                </small>
-              </figcaption>
-            </template>
-
-            <template v-else>
-              <div class="stage-placeholder" aria-hidden="true">
-                <div class="stage-placeholder-bar"></div>
-                <div class="stage-placeholder-bar stage-placeholder-bar--short"></div>
-                <div class="stage-placeholder-grid">
-                  <span v-for="index in 6" :key="index" class="stage-placeholder-dot"></span>
+        <div class="group-tasks">
+          <article v-for="task in group.tasks" :key="task.taskId" class="task-row">
+            <button class="task-toggle" type="button" @click="toggleTask(task.taskId)">
+              <aside class="task-meta">
+                <div class="task-badges">
+                  <span v-if="task.versionLabel" class="task-badge task-badge--version">{{ task.versionLabel }}</span>
+                  <span v-if="task.branchKind" class="task-badge">{{ task.branchKind }}</span>
+                  <span v-if="task.versionTag" class="task-badge">{{ task.versionTag }}</span>
                 </div>
-              </div>
-              <figcaption>
-                <strong>{{ stage.index }} · {{ stage.name }}</strong>
-                <span>{{ stage.placeholderMessage ?? stage.deltaSummary }}</span>
-                <small>阶段进行中，完成后会立刻替换为最新截图。</small>
-              </figcaption>
-            </template>
-          </figure>
+                <p class="task-id">{{ task.taskId }}</p>
+                <p class="task-time">{{ new Date(task.createdAt).toLocaleString() }}</p>
+                <p class="task-exit">
+                  {{ task.status === 'running' ? `进行中：${task.activeStepLabel ?? '处理中'}` : `退出：${task.exitReason}` }}
+                </p>
+                <p class="task-best">最佳阶段：{{ task.bestStageIndex || '--' }}</p>
+              </aside>
+
+              <span class="task-toggle-indicator">
+                {{ isExpanded(task.taskId) ? '收起' : '展开' }}
+              </span>
+            </button>
+
+            <div v-if="isExpanded(task.taskId)" class="stage-strip">
+              <figure class="stage-card source-card">
+                <img :src="`/${task.inputImage}`" alt="source reference" loading="lazy" />
+                <figcaption>
+                  <strong>原图</strong>
+                  <span>{{ task.caseLabel ?? '输入设计图' }}</span>
+                </figcaption>
+              </figure>
+
+              <figure
+                v-if="task.status === 'running' && !task.stages.length"
+                class="stage-card stage-card--running"
+              >
+                <div class="stage-placeholder" aria-hidden="true">
+                  <div class="stage-placeholder-bar"></div>
+                  <div class="stage-placeholder-bar stage-placeholder-bar--short"></div>
+                  <div class="stage-placeholder-grid">
+                    <span v-for="index in 6" :key="index" class="stage-placeholder-dot"></span>
+                  </div>
+                </div>
+                <figcaption>
+                  <strong>准备中</strong>
+                  <span>{{ task.activeStepLabel ?? '正在解析设计图结构…' }}</span>
+                  <small>阶段占位会在首个截图完成后即时替换。</small>
+                </figcaption>
+              </figure>
+
+              <figure
+                v-for="stage in task.stages"
+                :key="`${task.taskId}-${stage.index}`"
+                class="stage-card"
+                :class="{ 'stage-card--running': stage.status === 'running' }"
+              >
+                <template v-if="stage.status === 'completed' && stage.screenshot">
+                  <img :src="`/${stage.screenshot}`" :alt="`${stage.name} screenshot`" loading="lazy" />
+                  <figcaption>
+                    <strong>{{ stage.index }} · {{ stage.name }}</strong>
+                    <span>{{ stage.deltaSummary }}</span>
+                    <small>
+                      相似度 {{ formatRate(stage.metrics?.visualSimilarity) }} ·
+                      遵从率 {{ formatRate(stage.debug?.overallAdherenceRate) }}
+                    </small>
+                    <small>{{ formatRenderMode(stage) }}</small>
+                    <small>
+                      溢出 {{ stage.metrics?.overflowCount ?? '--' }} · 遮挡
+                      {{ stage.metrics?.occlusionCount ?? '--' }} · 严重问题
+                      {{ stage.metrics?.criticalIssueCount ?? '--' }}
+                    </small>
+                  </figcaption>
+                </template>
+
+                <template v-else>
+                  <div class="stage-placeholder" aria-hidden="true">
+                    <div class="stage-placeholder-bar"></div>
+                    <div class="stage-placeholder-bar stage-placeholder-bar--short"></div>
+                    <div class="stage-placeholder-grid">
+                      <span v-for="index in 6" :key="index" class="stage-placeholder-dot"></span>
+                    </div>
+                  </div>
+                  <figcaption>
+                    <strong>{{ stage.index }} · {{ stage.name }}</strong>
+                    <span>{{ stage.placeholderMessage ?? stage.deltaSummary }}</span>
+                    <small>阶段进行中，完成后会立刻替换为最新截图。</small>
+                  </figcaption>
+                </template>
+              </figure>
+            </div>
+          </article>
         </div>
       </article>
     </section>

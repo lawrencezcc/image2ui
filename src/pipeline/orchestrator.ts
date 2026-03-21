@@ -154,6 +154,12 @@ function normalizeNode(rawNode: Record<string, unknown>, index: number): SceneNo
               rawNode.align === 'center' || rawNode.align === 'right' ? rawNode.align : 'left',
             wrap: 'nowrap',
             overflow: 'clip',
+            direction:
+              rawNode.direction === 'vertical' ||
+              rawNode.direction === 'rotate-ccw' ||
+              rawNode.direction === 'rotate-cw'
+                ? rawNode.direction
+                : 'horizontal',
             box: {
               width: nodeWidth,
               height: nodeHeight,
@@ -161,6 +167,10 @@ function normalizeNode(rawNode: Record<string, unknown>, index: number): SceneNo
           }
         : undefined,
     svg: typeof rawNode.svg === 'string' ? String(rawNode.svg) : undefined,
+    canvas:
+      rawNode.canvas && typeof rawNode.canvas === 'object'
+        ? (rawNode.canvas as SceneNode['canvas'])
+        : undefined,
     notes: typeof rawNode.notes === 'string' ? rawNode.notes : undefined,
   }
 }
@@ -896,6 +906,13 @@ function buildTaskSummary(params: {
     name: string
     placeholderMessage: string
   }
+  comparisonGroupId?: string
+  comparisonGroupLabel?: string
+  caseId?: string
+  caseLabel?: string
+  versionLabel?: string
+  versionTag?: string
+  branchKind?: 'dom-svg' | 'canvas' | 'adhoc'
 }): TaskTimelineSummary {
   const completedStages: TaskSummaryStage[] = params.stages.map((stage, index) => ({
     index: stage.index,
@@ -936,6 +953,13 @@ function buildTaskSummary(params: {
     activeStepLabel: params.activeStepLabel,
     bestStageIndex: params.bestStage?.index ?? 0,
     finalStageIndex: params.stages.at(-1)?.index ?? 0,
+    comparisonGroupId: params.comparisonGroupId,
+    comparisonGroupLabel: params.comparisonGroupLabel,
+    caseId: params.caseId,
+    caseLabel: params.caseLabel,
+    versionLabel: params.versionLabel,
+    versionTag: params.versionTag,
+    branchKind: params.branchKind,
     stages: completedStages,
   }
 }
@@ -1037,9 +1061,12 @@ function hasDegenerateRenderableNode(scene: SceneDocument) {
 }
 
 function isUsableScene(scene: SceneDocument, renderPreference: RenderPreference, promptText?: string) {
+  const chartLike = detectChartLikeScene(scene, promptText)
   const meaningfulNodes = scene.nodes.filter((node) => node.type !== 'frame')
   const textNodes = scene.nodes.filter((node) => node.type === 'text')
-  const baseValidity = scene.nodes.length >= 4 && meaningfulNodes.length >= 2 && textNodes.length >= 1
+  const baseValidity = chartLike
+    ? scene.nodes.length >= 2 && meaningfulNodes.length >= 1
+    : scene.nodes.length >= 4 && meaningfulNodes.length >= 2 && textNodes.length >= 1
 
   if (!baseValidity) {
     return false
@@ -1049,14 +1076,24 @@ function isUsableScene(scene: SceneDocument, renderPreference: RenderPreference,
     return false
   }
 
-  if (detectChartLikeScene(scene, promptText)) {
+  if (chartLike) {
     return hasRenderableChartPayload(scene, renderPreference)
   }
 
   return true
 }
 
-export async function runTask(options: { imagePath: string; promptText?: string }): Promise<TaskResult> {
+export async function runTask(options: {
+  imagePath: string
+  promptText?: string
+  comparisonGroupId?: string
+  comparisonGroupLabel?: string
+  caseId?: string
+  caseLabel?: string
+  versionLabel?: string
+  versionTag?: string
+  branchKind?: 'dom-svg' | 'canvas' | 'adhoc'
+}): Promise<TaskResult> {
   const sourceImagePath = path.resolve(options.imagePath)
   const renderPreference = extractRenderPreference(options.promptText)
 
@@ -1087,6 +1124,15 @@ export async function runTask(options: { imagePath: string; promptText?: string 
   let exitReason: ExitReason = 'max_iterations'
   let bestStage: StageArtifact | undefined
   let latestStage: StageArtifact | undefined
+  const summaryMeta = {
+    comparisonGroupId: options.comparisonGroupId,
+    comparisonGroupLabel: options.comparisonGroupLabel,
+    caseId: options.caseId,
+    caseLabel: options.caseLabel,
+    versionLabel: options.versionLabel,
+    versionTag: options.versionTag,
+    branchKind: options.branchKind ?? (renderPreference === 'canvas' ? 'canvas' : 'dom-svg'),
+  }
 
   await fs.copyFile(sourceImagePath, sourceCopyPath)
   await sharp(sourceImagePath)
@@ -1107,6 +1153,7 @@ export async function runTask(options: { imagePath: string; promptText?: string 
     modelImagePath,
     promptText: options.promptText ?? '',
     renderPreference,
+    ...summaryMeta,
     config: pipelineDefaults,
   })
   await updateTimeline(
@@ -1117,6 +1164,7 @@ export async function runTask(options: { imagePath: string; promptText?: string 
       stages,
       status: 'running',
       activeStepLabel: 'scene 解析中',
+      ...summaryMeta,
     }),
   )
   await appendEvent(taskId, {
@@ -1144,6 +1192,7 @@ export async function runTask(options: { imagePath: string; promptText?: string 
           stages,
           status: 'running',
           activeStepLabel: 'ocr 解析中',
+          ...summaryMeta,
         }),
       )
       const ocrResult = await qwenOcr.recognize({
@@ -1188,14 +1237,17 @@ export async function runTask(options: { imagePath: string; promptText?: string 
       try {
         const chartSpecResponse = await qwenVl.complete({
           imagePaths: [modelImagePath],
-          prompt: createChartSpecPrompt(width, height, renderPreference, ocrHint, options.promptText),
+          prompt: createChartSpecPrompt(width, height, 'auto', ocrHint, options.promptText),
         })
-        const chartScene = buildSceneFromChartSpec({
+        const chartScene = await buildSceneFromChartSpec({
           rawSpec: parseLooseJson(chartSpecResponse.text),
           imagePath: toPublicRelative(sourceCopyPath),
+          sampleImagePath: sourceCopyPath,
           width,
           height,
           words: ocrWords,
+          renderPreference,
+          promptText: options.promptText,
         })
 
         if (chartScene && isUsableScene(chartScene, renderPreference, options.promptText)) {
@@ -1281,12 +1333,15 @@ export async function runTask(options: { imagePath: string; promptText?: string 
       try {
         const sceneResponse = await candidate.run()
         const rawScene = parseScenePayload(sceneResponse.scene_json)
-        const bridgedScene = buildSceneFromChartSpec({
+        const bridgedScene = await buildSceneFromChartSpec({
           rawSpec: rawScene,
           imagePath: toPublicRelative(sourceCopyPath),
+          sampleImagePath: sourceCopyPath,
           width,
           height,
           words: ocrWords,
+          renderPreference,
+          promptText: options.promptText,
         })
 
         const candidateScene = bridgedScene
@@ -1360,6 +1415,7 @@ export async function runTask(options: { imagePath: string; promptText?: string 
             name: stageName,
             placeholderMessage: '正在生成组件、渲染截图并执行检测…',
           },
+          ...summaryMeta,
         }),
       )
 
@@ -1450,6 +1506,7 @@ export async function runTask(options: { imagePath: string; promptText?: string 
           bestStage,
           status: 'running',
           activeStepLabel: '分析修复建议中',
+          ...summaryMeta,
         }),
       )
 
@@ -1551,6 +1608,7 @@ export async function runTask(options: { imagePath: string; promptText?: string 
           stages,
           status: 'completed',
           exitReason: 'model_error',
+          ...summaryMeta,
         }),
       )
       throw error
@@ -1574,6 +1632,7 @@ export async function runTask(options: { imagePath: string; promptText?: string 
       bestStage,
       status: 'completed',
       exitReason,
+      ...summaryMeta,
     }),
   }
 

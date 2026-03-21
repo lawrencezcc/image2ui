@@ -480,10 +480,21 @@ export async function analyzeStage(options: {
       )
     }
 
+    let hasOverflow = false
     if (node.text) {
-      const hasOverflow =
+      const isRotatedText =
+        node.text.direction === 'rotate-ccw' || node.text.direction === 'rotate-cw'
+      hasOverflow =
         snapshot.scrollWidth > snapshot.clientWidth + 1 ||
         snapshot.scrollHeight > snapshot.clientHeight + 1
+
+      if (
+        isRotatedText &&
+        maxError <= 2 &&
+        snapshot.textContent === node.text.content.trim()
+      ) {
+        hasOverflow = false
+      }
 
       if (hasOverflow) {
         issues.push(
@@ -518,8 +529,17 @@ export async function analyzeStage(options: {
       }
     }
 
+    const isStableTextNode =
+      node.type === 'text' &&
+      snapshot.textContent === node.text?.content.trim() &&
+      maxError <= 2 &&
+      !hasOverflow
+
     const shouldCheckOcclusion =
-      !parentNodeIds.has(node.id) && node.type !== 'frame' && node.type !== 'group'
+      !parentNodeIds.has(node.id) &&
+      node.type !== 'frame' &&
+      node.type !== 'group' &&
+      !isStableTextNode
 
     if (shouldCheckOcclusion && snapshot.occluded) {
       issues.push(

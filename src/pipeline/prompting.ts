@@ -10,9 +10,14 @@ function projectMemoryInstructions() {
 `.trim()
 }
 
+function stripRenderMarkers(promptText?: string) {
+  return promptText?.replace(/\/(?:svg|canvas)\//gi, '').replace(/\s+/g, ' ').trim()
+}
+
 function renderPreferenceInstructions(renderPreference: RenderPreference, promptText?: string) {
-  const promptLine = promptText
-    ? `- 用户生成提示词：${promptText}`
+  const semanticPrompt = stripRenderMarkers(promptText)
+  const promptLine = semanticPrompt
+    ? `- 用户生成提示词：${semanticPrompt}`
     : '- 用户未提供显式渲染偏好提示词。'
 
   if (renderPreference === 'svg') {
@@ -102,6 +107,9 @@ ${projectMemoryInstructions()}
 目标：
 - 这一步不是直接生成 Vue 代码，而是提取足够稳定的图表结构，供后续 scene 构建和组件生成使用。
 - 重点识别图例、坐标轴、刻度、类别、系列颜色、每个系列的数据点或柱状值。
+- 如果是折线图、面积图、散点图、雷达图等，优先提供更细的几何采样点 points，便于高保真重建。
+- 如果是环形图、饼图，尽量给出每个扇区的独立值。
+- 如果是堆叠柱状图、组合图或带虚线台阶线的图，请在 plotHint 中显式说明 stacked / stepLine。
 - 数值允许是视觉估计值，但必须和图中几何关系一致，不能凭空捏造不存在的系列或标签。
 - 保持输出紧凑，只输出 JSON。
 - 图表主内容优先服务于 ${renderPreference} 重建；如果图中是柱状图、折线图、面积图等，请明确 subtype。
@@ -126,12 +134,26 @@ ${ocrHint}`
 - JSON 字段固定为：
 {
   "type": "chart",
-  "subtype": "bar|line|area|pie|scatter|other",
+  "subtype": "grouped-bar|stacked-bar|bar|line|area|pie|donut|radar|scatter|combo|other",
   "title": "",
+  "plotHint": {
+    "shape": "cartesian|polar",
+    "innerRadiusRatio": 0.58,
+    "stacked": false,
+    "stepLine": false
+  },
   "xAxis": { "label": "", "categories": [] },
   "yAxis": { "label": "", "min": 0, "max": 0, "step": 0 },
   "series": [
-    { "name": "", "color": "#000000", "data": [] }
+    {
+      "name": "",
+      "color": "#000000",
+      "fillColor": "#000000",
+      "data": [],
+      "points": [{ "x": 0.0, "y": 0.0 }],
+      "areaOpacity": 0.18,
+      "lineDash": [8, 6]
+    }
   ],
   "legend": {
     "items": [
@@ -142,7 +164,9 @@ ${ocrHint}`
 
 硬性要求：
 - 所有颜色使用十六进制。
-- series.data 长度必须和 xAxis.categories 长度一致。
+- 如果是常规柱状图/折线图/面积图，series.data 长度必须和 xAxis.categories 长度一致。
+- 如果是饼图/环形图，每个 series.data 只保留一个值。
+- points 中的 x / y 采用 0 到 1 的归一化坐标，表示相对 plot 区域的位置。
 - 如果图中没有 title，title 为空字符串。
 - 如果无法确定 min/max/step，请给出最贴近图中刻度的估计值。
 - 不要输出 scene.json，不要输出节点树。
@@ -159,6 +183,7 @@ ${projectMemoryInstructions()}
 - 生成 clone-static 风格的可渲染组件，优先视觉保真。
 - 根节点必须带 data-artboard-root="true"。
 - 每个 scene node 都必须映射到一个带 data-node-id="<node.id>" 的 DOM 或 SVG 节点。
+- 如果 scene 中存在 render 为 canvas 的节点，允许使用 <canvas> + onMounted 绘制，但仍需保留对应 data-node-id。
 - 不要依赖任何外部组件库、字体 CDN 或图片 URL。
 - 允许使用内联 svg、绝对定位、渐变、阴影、裁切。
 - 默认保持 fixed-size artboard，不要擅自改成响应式重排。
@@ -205,6 +230,7 @@ ${projectMemoryInstructions()}
 - 先处理 critical/high 问题。
 - 优先解决：文字溢出、遮挡、错位、对齐、层级。
 - 如果某个节点适合从 html 改为 svg，可以这样做，但保留原 node id。
+- 如果某个节点是 canvas 图表节点，允许继续使用 <canvas> 绘制并只修复对应绘图逻辑，不要擅自退回空容器。
 - 如果本轮结果不如历史最佳，请参考 best-stage 的结构，不要继续在错误方向上放大偏差。
 
 scene.json:

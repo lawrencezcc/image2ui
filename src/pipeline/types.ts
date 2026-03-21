@@ -44,10 +44,64 @@ export interface TextSpec {
   align: 'left' | 'center' | 'right'
   wrap: 'nowrap' | 'normal'
   overflow: 'clip' | 'visible'
+  direction?: 'horizontal' | 'vertical' | 'rotate-ccw' | 'rotate-cw'
   box: {
     width: number
     height: number
   }
+}
+
+export interface ChartPoint {
+  x: number
+  y: number
+  value?: number
+  label?: string
+}
+
+export interface CanvasChartSeries {
+  name: string
+  color: string
+  fillColor?: string
+  data: number[]
+  points?: ChartPoint[]
+  areaOpacity?: number
+  lineDash?: number[]
+}
+
+export interface CanvasChartOverlay {
+  type: 'step-line' | 'line' | 'leader-line'
+  color: string
+  dash?: number[]
+  data?: number[]
+  points?: ChartPoint[]
+  dotRadius?: number
+}
+
+export interface CanvasChartSpec {
+  kind:
+    | 'grouped-bar'
+    | 'stacked-bar'
+    | 'line'
+    | 'area'
+    | 'radar'
+    | 'donut'
+    | 'pie'
+    | 'scatter'
+  width: number
+  height: number
+  plot: Frame
+  categories: string[]
+  min: number
+  max: number
+  step: number
+  innerRadiusRatio?: number
+  startAngle?: number
+  legendItems?: Array<{
+    name: string
+    color: string
+  }>
+  series: CanvasChartSeries[]
+  overlays?: CanvasChartOverlay[]
 }
 
 export interface SceneNode {
@@ -71,6 +125,7 @@ export interface SceneNode {
     viewBox: string
     preserveAspectRatio?: string
   } | string
+  canvas?: CanvasChartSpec
   notes?: string
 }
 
@@ -267,6 +322,13 @@ export interface TaskTimelineSummary {
   activeStepLabel?: string
   bestStageIndex: number
   finalStageIndex: number
+  comparisonGroupId?: string
+  comparisonGroupLabel?: string
+  caseId?: string
+  caseLabel?: string
+  versionLabel?: string
+  versionTag?: string
+  branchKind?: 'dom-svg' | 'canvas' | 'adhoc'
   stages: TaskSummaryStage[]
 }
 

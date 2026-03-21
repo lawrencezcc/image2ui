@@ -4,12 +4,29 @@ import { getArgValue } from '../src/pipeline/utils'
 async function main() {
   const imagePath = getArgValue('--image')
   const promptText = getArgValue('--prompt')
+  const comparisonGroupId = getArgValue('--group-id')
+  const comparisonGroupLabel = getArgValue('--group-label')
+  const caseId = getArgValue('--case-id')
+  const caseLabel = getArgValue('--case-label')
+  const versionLabel = getArgValue('--version-label')
+  const versionTag = getArgValue('--version-tag')
+  const branchKind = getArgValue('--branch-kind') as 'dom-svg' | 'canvas' | 'adhoc' | undefined
 
   if (!imagePath) {
     throw new Error('请通过 --image 指定验证图片路径。')
   }
 
-  const result = await runTask({ imagePath, promptText })
+  const result = await runTask({
+    imagePath,
+    promptText,
+    comparisonGroupId,
+    comparisonGroupLabel,
+    caseId,
+    caseLabel,
+    versionLabel,
+    versionTag,
+    branchKind,
+  })
   console.log(
     JSON.stringify(
       {

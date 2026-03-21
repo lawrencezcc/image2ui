@@ -9,6 +9,8 @@
     "preview": "vite preview",
     "task:run": "tsx scripts/run-task.ts",
     "task:verify": "tsx scripts/verify-task.ts",
+    "fixtures:generate": "tsx scripts/generate-regression-fixtures.ts",
+    "regression:run": "tsx scripts/run-regression.ts",
     "qwen:test": "tsx scripts/test-qwen-vl.ts",
     "qwen:ocr:test": "tsx scripts/test-qwen-ocr.ts",
     "playwright:install": "playwright install chromium"

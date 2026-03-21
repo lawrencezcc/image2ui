@@ -82,6 +82,46 @@ img {
   gap: 18px;
 }
 
+.task-group {
+  display: grid;
+  gap: 14px;
+}
+
+.group-header {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 0 4px;
+}
+
+.group-eyebrow {
+  margin: 0 0 6px;
+  color: #94a3b8;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.group-header h2 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: -0.03em;
+}
+
+.group-count {
+  color: #64748b;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.group-tasks {
+  display: grid;
+  gap: 18px;
+}
+
 .task-row {
   display: grid;
   gap: 16px;
@@ -109,6 +149,29 @@ img {
   display: grid;
   gap: 10px;
   padding-top: 6px;
+}
+
+.task-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.task-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 10px;
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  border-radius: 999px;
+  color: #475569;
+  background: rgba(248, 250, 252, 0.9);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+}
+
+.task-badge--version {
+  color: #0f172a;
+  background: #ffffff;
 }
 
 .task-id,
