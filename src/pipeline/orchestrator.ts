@@ -1,0 +1,1390 @@
+import fs from 'node:fs/promises'
+import path from 'node:path'
+
+import { jsonrepair } from 'jsonrepair'
+import sharp from 'sharp'
+
+import { analyzeStage } from './analyze'
+import { pipelineDefaults } from './config'
+import { CodexCliClient } from './codex-client'
+import { computeDebugStats } from './debug-stats'
+import { buildFallbackComponent, isRenderableSfc } from './fallback'
+import { createRepairPrompt, createScenePrompt } from './prompting'
+import { StageRenderer } from './render'
+import { componentResponseSchema, sceneResponseSchema } from './schemas'
+import {
+  appendEvent,
+  ensureArtifactsLayout,
+  getStageDirectoryName,
+  prepareTaskDirectories,
+  toPublicRelative,
+  updateTimeline,
+} from './store'
+import type {
+  ComponentResponse,
+  Constraint,
+  ExitReason,
+  RenderMode,
+  RenderPreference,
+  SceneDocument,
+  SceneNode,
+  StageArtifact,
+  StageMetrics,
+  TaskResult,
+  TaskSummaryStage,
+  TaskTimelineSummary,
+} from './types'
+import {
+  createTaskId,
+  ensureDir,
+  extractRenderPreference,
+  fileExists,
+  readJson,
+  slugify,
+  writeJson,
+  writeText,
+} from './utils'
+
+function sanitizeSfc(source: string) {
+  const fencedMatch = source.match(/```(?:vue)?\s*([\s\S]*?)```/i)
+  return (fencedMatch?.[1] ?? source).trim()
+}
+
+function ensureRenderableSfc(source: string, scene: SceneDocument) {
+  const sanitized = sanitizeSfc(source)
+  if (isRenderableSfc(sanitized)) {
+    return sanitized
+  }
+
+  return buildFallbackComponent(scene)
+}
+
+function normalizeRadius(rawNode: Record<string, unknown>) {
+  const radius = typeof rawNode.radius === 'number' ? rawNode.radius : undefined
+  return radius ? [radius, radius, radius, radius] : undefined
+}
+
+function normalizeFill(rawNode: Record<string, unknown>) {
+  if (typeof rawNode.fill === 'string') {
+    return String(rawNode.fill)
+  }
+
+  if (typeof rawNode.stroke === 'string') {
+    return String(rawNode.stroke)
+  }
+
+  const style = rawNode.style as Record<string, unknown> | undefined
+  const fills = Array.isArray(style?.fills) ? (style?.fills as string[]) : undefined
+  return fills?.[0]
+}
+
+function normalizeNode(rawNode: Record<string, unknown>, index: number): SceneNode {
+  const rawType = String(rawNode.type ?? 'frame')
+  const rawText =
+    typeof rawNode.text === 'string'
+      ? rawNode.text
+      : typeof rawNode.content === 'string'
+        ? rawNode.content
+        : typeof rawNode.label === 'string'
+          ? rawNode.label
+          : rawType === 'text' && typeof rawNode.name === 'string'
+            ? rawNode.name
+            : undefined
+  const fill = normalizeFill(rawNode)
+  const x = Number(rawNode.x ?? (rawNode.frame as Record<string, unknown> | undefined)?.x ?? 0)
+  const y = Number(rawNode.y ?? (rawNode.frame as Record<string, unknown> | undefined)?.y ?? 0)
+  const nodeWidth = Number(
+    rawNode.width ?? (rawNode.frame as Record<string, unknown> | undefined)?.width ?? 0,
+  )
+  const nodeHeight = Number(
+    rawNode.height ?? (rawNode.frame as Record<string, unknown> | undefined)?.height ?? 0,
+  )
+
+  return {
+    id: String(rawNode.id ?? `node-${index + 1}`),
+    name: typeof rawNode.name === 'string' ? rawNode.name : undefined,
+    type: rawType,
+    render:
+      rawType === 'canvas'
+        ? 'canvas'
+        : rawType === 'svg' || rawType.includes('chart') || rawType === 'path' || rawType === 'ellipse'
+        ? 'svg'
+        : 'html',
+    parentId:
+      typeof rawNode.parentId === 'string'
+        ? rawNode.parentId
+        : String(rawNode.id ?? '') === 'card'
+          ? null
+          : 'card',
+    frame: {
+      x,
+      y,
+      width: nodeWidth,
+      height: nodeHeight,
+      rotation: Number(rawNode.rotation ?? 0),
+    },
+    zIndex: Number(rawNode.zIndex ?? index + 1),
+    opacity: Number(rawNode.opacity ?? 1),
+    clip:
+      typeof rawNode.clip === 'boolean'
+        ? {
+            enabled: rawNode.clip,
+            overflow: rawNode.clip ? 'hidden' : 'visible',
+            radius: normalizeRadius(rawNode),
+          }
+        : undefined,
+    style: {
+      fills: fill ? [fill] : undefined,
+      background: fill,
+    },
+    text:
+      typeof rawText === 'string'
+        ? {
+            content: rawText,
+            fontFamily: String(rawNode.fontFamily ?? 'Inter'),
+            fontWeight: Number(rawNode.fontWeight ?? 500),
+            fontSize: Number(rawNode.fontSize ?? 14),
+            lineHeight: Number(rawNode.lineHeight ?? Math.round(Number(rawNode.fontSize ?? 14) * 1.4)),
+            letterSpacing: Number(rawNode.letterSpacing ?? 0),
+            color: String(rawNode.color ?? '#111111'),
+            align:
+              rawNode.align === 'center' || rawNode.align === 'right' ? rawNode.align : 'left',
+            wrap: 'nowrap',
+            overflow: 'clip',
+            box: {
+              width: nodeWidth,
+              height: nodeHeight,
+            },
+          }
+        : undefined,
+    svg: typeof rawNode.svg === 'string' ? String(rawNode.svg) : undefined,
+    notes: typeof rawNode.notes === 'string' ? rawNode.notes : undefined,
+  }
+}
+
+function flattenNestedNodes(
+  nodes: Array<Record<string, unknown>>,
+  parentId: string | null,
+  acc: Array<Record<string, unknown>>,
+) {
+  for (const rawNode of nodes) {
+    const nodeId = String(rawNode.id ?? `node-${acc.length + 1}`)
+    acc.push({
+      ...rawNode,
+      id: nodeId,
+      parentId,
+    })
+
+    if (Array.isArray(rawNode.children)) {
+      flattenNestedNodes(rawNode.children as Array<Record<string, unknown>>, nodeId, acc)
+    }
+  }
+}
+
+function extractSceneNodes(rawScene: Record<string, unknown>) {
+  if (Array.isArray(rawScene.nodes)) {
+    const rawNodes = rawScene.nodes as Array<Record<string, unknown>>
+    if (rawNodes.some((node) => Array.isArray(node.children))) {
+      const flattened: Array<Record<string, unknown>> = []
+      flattenNestedNodes(rawNodes, null, flattened)
+      return {
+        coordinateMode: 'relative' as const,
+        artboardRecord: undefined,
+        nodes: flattened,
+      }
+    }
+
+    return {
+      coordinateMode: 'relative' as const,
+      artboardRecord: undefined,
+      nodes: rawNodes,
+    }
+  }
+
+  const artboards = Array.isArray(rawScene.artboards)
+    ? (rawScene.artboards as Array<Record<string, unknown>>)
+    : []
+  const artboardRecord = artboards[0]
+  const flattened: Array<Record<string, unknown>> = []
+
+  if (artboardRecord && Array.isArray(artboardRecord.children)) {
+    flattenNestedNodes(artboardRecord.children as Array<Record<string, unknown>>, null, flattened)
+  }
+
+  return {
+    coordinateMode: 'absolute' as const,
+    artboardRecord,
+    nodes: flattened,
+  }
+}
+
+function normalizeConstraints(rawScene: Record<string, unknown>, nodes: SceneNode[]) {
+  const fromNodes: Constraint[] = []
+
+  for (const node of nodes) {
+    const rawNode = (rawScene.nodes as Array<Record<string, unknown>> | undefined)?.find(
+      (candidate) => String(candidate.id ?? '') === node.id,
+    )
+    const rawConstraints = rawNode?.constraints
+
+    if (!rawConstraints || Array.isArray(rawConstraints) || typeof rawConstraints !== 'object') {
+      continue
+    }
+
+    for (const [key, value] of Object.entries(rawConstraints as Record<string, unknown>)) {
+      if (value === 'inside-parent') {
+        fromNodes.push({
+          type: 'inside-parent',
+          nodeId: node.id,
+          parentId: node.parentId ?? 'card',
+          tolerance: 2,
+        })
+        continue
+      }
+
+      if (key === 'no-text-overflow' && value === true) {
+        fromNodes.push({
+          type: 'no-text-overflow',
+          nodeId: node.id,
+          tolerance: 1,
+        })
+      }
+    }
+  }
+
+  const rawConstraints = Array.isArray(rawScene.constraints) ? rawScene.constraints : []
+  const normalized: Constraint[] = []
+
+  for (const constraint of rawConstraints) {
+    if (!constraint || typeof constraint !== 'object') {
+      continue
+    }
+
+    const rawConstraint = constraint as Record<string, unknown>
+    normalized.push({
+      type: String(rawConstraint.type ?? 'inside-parent') as Constraint['type'],
+      nodeId: typeof rawConstraint.nodeId === 'string' ? rawConstraint.nodeId : undefined,
+      nodes: Array.isArray(rawConstraint.nodes) ? (rawConstraint.nodes as string[]) : undefined,
+      parentId: typeof rawConstraint.parentId === 'string' ? rawConstraint.parentId : undefined,
+      value: typeof rawConstraint.value === 'number' ? rawConstraint.value : undefined,
+      tolerance: typeof rawConstraint.tolerance === 'number' ? rawConstraint.tolerance : 1,
+    })
+  }
+
+  return [...normalized, ...fromNodes]
+}
+
+function createNodeMap(nodes: SceneNode[]) {
+  return new Map(nodes.map((node) => [node.id, node]))
+}
+
+function inferParentId(node: SceneNode, nodes: SceneNode[]) {
+  const candidates = nodes
+    .filter((candidate) => candidate.id !== node.id)
+    .filter((candidate) => ['frame', 'group', 'rect'].includes(candidate.type))
+    .filter(
+      (candidate) =>
+        node.frame.x >= 0 &&
+        node.frame.y >= 0 &&
+        node.frame.width <= candidate.frame.width + 2 &&
+        node.frame.height <= candidate.frame.height + 2 &&
+        node.frame.x + node.frame.width <= candidate.frame.width + 2 &&
+        node.frame.y + node.frame.height <= candidate.frame.height + 2,
+    )
+    .sort(
+      (left, right) =>
+        left.frame.width * left.frame.height - right.frame.width * right.frame.height,
+    )
+
+  return candidates[0]?.id ?? null
+}
+
+function repairParentLinks(nodes: SceneNode[]) {
+  const existingIds = new Set(nodes.map((node) => node.id))
+
+  return nodes.map((node) => {
+    const parentExists = node.parentId ? existingIds.has(node.parentId) : false
+    if (parentExists || node.parentId === null) {
+      return node
+    }
+
+    return {
+      ...node,
+      parentId: inferParentId(node, nodes),
+    }
+  })
+}
+
+function detectRelativeParents(nodes: SceneNode[]) {
+  const nodeMap = createNodeMap(nodes)
+  const relativeParents = new Set<string>()
+
+  for (const node of nodes) {
+    if (!node.parentId) {
+      continue
+    }
+
+    const parent = nodeMap.get(node.parentId)
+    if (!parent) {
+      continue
+    }
+
+    if (node.frame.x < parent.frame.x || node.frame.y < parent.frame.y) {
+      relativeParents.add(parent.id)
+    }
+  }
+
+  return relativeParents
+}
+
+function resolveAbsoluteFrame(
+  node: SceneNode,
+  nodeMap: Map<string, SceneNode>,
+  relativeParents: Set<string>,
+): SceneNode['frame'] {
+  if (!node.parentId) {
+    return { ...node.frame }
+  }
+
+  const parent = nodeMap.get(node.parentId)
+  if (!parent) {
+    return { ...node.frame }
+  }
+
+  const parentFrame = resolveAbsoluteFrame(parent, nodeMap, relativeParents)
+  if (!relativeParents.has(parent.id)) {
+    return { ...node.frame }
+  }
+
+  return {
+    ...node.frame,
+    x: parentFrame.x + node.frame.x,
+    y: parentFrame.y + node.frame.y,
+  }
+}
+
+function normalizeScene(scene: SceneDocument, imagePath: string, width: number, height: number): SceneDocument {
+  const rawScene = scene as unknown as Record<string, unknown>
+  const extracted = extractSceneNodes(rawScene)
+  const rawNodes = repairParentLinks(extracted.nodes.map((node, index) => normalizeNode(node, index)))
+  const relativeParents =
+    extracted.coordinateMode === 'relative' ? detectRelativeParents(rawNodes) : new Set<string>()
+  const nodeMap = createNodeMap(rawNodes)
+  const normalizedNodes = rawNodes.map((node) => ({
+    ...node,
+    frame:
+      extracted.coordinateMode === 'relative'
+        ? resolveAbsoluteFrame(node, nodeMap, relativeParents)
+        : { ...node.frame },
+  }))
+  const artboardRecord = extracted.artboardRecord
+  const artboardChildren = Array.isArray(artboardRecord?.children)
+    ? (artboardRecord.children as Array<Record<string, unknown>>)
+    : []
+  const normalizedBackground =
+    scene.artboard?.background ||
+    (typeof artboardRecord?.background === 'string' ? String(artboardRecord.background) : undefined) ||
+    normalizeFill(artboardChildren[0] ?? {}) ||
+    '#ffffff'
+  const normalizedWidth =
+    scene.artboard?.width || Number(artboardRecord?.width ?? rawScene.width ?? width)
+  const normalizedHeight =
+    scene.artboard?.height || Number(artboardRecord?.height ?? rawScene.height ?? height)
+
+  return {
+    ...scene,
+    version: scene.version || '1.0',
+    mode: 'clone-static',
+    source: {
+      image: imagePath,
+      width,
+      height,
+      dpr: scene.source?.dpr ?? 1,
+    },
+    artboard: {
+      width: normalizedWidth,
+      height: normalizedHeight,
+      background: normalizedBackground,
+      clip:
+        scene.artboard?.clip ??
+        (typeof artboardRecord?.clip === 'boolean' ? artboardRecord.clip : false),
+    },
+    nodes: normalizedNodes,
+    constraints: normalizeConstraints(rawScene, normalizedNodes),
+  }
+}
+
+function scaleSceneGeometry(
+  scene: SceneDocument,
+  scaleX: number,
+  scaleY: number,
+  targetWidth: number,
+  targetHeight: number,
+) {
+  if (
+    !Number.isFinite(scaleX) ||
+    !Number.isFinite(scaleY) ||
+    scaleX <= 0 ||
+    scaleY <= 0 ||
+    (Math.abs(scaleX - 1) < 0.02 && Math.abs(scaleY - 1) < 0.02)
+  ) {
+    return scene
+  }
+
+  return {
+    ...scene,
+    artboard: {
+      ...scene.artboard,
+      width: targetWidth,
+      height: targetHeight,
+    },
+    nodes: scene.nodes.map((node) => {
+      const scaledFrame = {
+        ...node.frame,
+        x: node.frame.x * scaleX,
+        y: node.frame.y * scaleY,
+        width: node.frame.width * scaleX,
+        height: node.frame.height * scaleY,
+      }
+
+      return {
+        ...node,
+        frame: scaledFrame,
+        text: node.text
+          ? {
+              ...node.text,
+              fontSize: node.text.fontSize * scaleY,
+              lineHeight: node.text.lineHeight * scaleY,
+              letterSpacing: node.text.letterSpacing * scaleX,
+              box: {
+                width: scaledFrame.width,
+                height: scaledFrame.height,
+              },
+            }
+          : undefined,
+        clip:
+          node.clip?.radius?.length
+            ? {
+                ...node.clip,
+                radius: node.clip.radius.map((value, index) =>
+                  value * (index % 2 === 0 ? scaleX : scaleY),
+                ),
+              }
+            : node.clip,
+      }
+    }),
+  }
+}
+
+function scaleSceneToSourceIfNeeded(scene: SceneDocument, width: number, height: number) {
+  const artboardWidth = scene.artboard.width || width
+  const artboardHeight = scene.artboard.height || height
+  const scaleX = width / artboardWidth
+  const scaleY = height / artboardHeight
+
+  const appearsDownscaled =
+    artboardWidth < width * 0.8 &&
+    artboardHeight < height * 0.8 &&
+    scaleX > 1.1 &&
+    scaleY > 1.1 &&
+    Math.abs(scaleX - scaleY) < 0.25
+
+  if (!appearsDownscaled) {
+    return scene
+  }
+
+  return scaleSceneGeometry(scene, scaleX, scaleY, width, height)
+}
+
+async function detectForegroundBounds(imagePath: string) {
+  const { data, info } = await sharp(imagePath).ensureAlpha().raw().toBuffer({ resolveWithObject: true })
+  const samplePoints = [
+    [0, 0],
+    [info.width - 1, 0],
+    [0, info.height - 1],
+    [info.width - 1, info.height - 1],
+  ]
+  const background = samplePoints.reduce(
+    (acc, [x, y]) => {
+      const index = (y * info.width + x) * info.channels
+      acc.r += data[index] ?? 0
+      acc.g += data[index + 1] ?? 0
+      acc.b += data[index + 2] ?? 0
+      return acc
+    },
+    { r: 0, g: 0, b: 0 },
+  )
+
+  background.r /= samplePoints.length
+  background.g /= samplePoints.length
+  background.b /= samplePoints.length
+
+  let minX = info.width
+  let minY = info.height
+  let maxX = -1
+  let maxY = -1
+
+  for (let y = 0; y < info.height; y += 1) {
+    for (let x = 0; x < info.width; x += 1) {
+      const index = (y * info.width + x) * info.channels
+      const distance = Math.sqrt(
+        ((data[index] ?? 0) - background.r) ** 2 +
+          ((data[index + 1] ?? 0) - background.g) ** 2 +
+          ((data[index + 2] ?? 0) - background.b) ** 2,
+      )
+
+      if (distance <= 18) {
+        continue
+      }
+
+      minX = Math.min(minX, x)
+      minY = Math.min(minY, y)
+      maxX = Math.max(maxX, x)
+      maxY = Math.max(maxY, y)
+    }
+  }
+
+  if (maxX < 0 || maxY < 0) {
+    return undefined
+  }
+
+  return {
+    x: minX,
+    y: minY,
+    width: maxX - minX + 1,
+    height: maxY - minY + 1,
+  }
+}
+
+function sceneContentBounds(scene: SceneDocument) {
+  const contentNodes = scene.nodes.filter(
+    (node) =>
+      !(
+        node.frame.x === 0 &&
+        node.frame.y === 0 &&
+        node.frame.width >= scene.artboard.width &&
+        node.frame.height >= scene.artboard.height
+      ),
+  )
+
+  if (!contentNodes.length) {
+    return undefined
+  }
+
+  const minX = Math.min(...contentNodes.map((node) => node.frame.x))
+  const minY = Math.min(...contentNodes.map((node) => node.frame.y))
+  const maxX = Math.max(...contentNodes.map((node) => node.frame.x + node.frame.width))
+  const maxY = Math.max(...contentNodes.map((node) => node.frame.y + node.frame.height))
+
+  return {
+    x: minX,
+    y: minY,
+    width: maxX - minX,
+    height: maxY - minY,
+  }
+}
+
+function fitSceneToReferenceBounds(
+  scene: SceneDocument,
+  referenceBounds?: { x: number; y: number; width: number; height: number },
+) {
+  if (!referenceBounds) {
+    return scene
+  }
+
+  const currentBounds = sceneContentBounds(scene)
+  if (!currentBounds || !currentBounds.width || !currentBounds.height) {
+    return scene
+  }
+
+  const scale = Math.min(
+    referenceBounds.width / currentBounds.width,
+    referenceBounds.height / currentBounds.height,
+  )
+
+  if (!Number.isFinite(scale) || scale < 1.08) {
+    return scene
+  }
+
+  return {
+    ...scene,
+    nodes: scene.nodes.map((node) => {
+      const scaledFrame = {
+        ...node.frame,
+        x: referenceBounds.x + (node.frame.x - currentBounds.x) * scale,
+        y: referenceBounds.y + (node.frame.y - currentBounds.y) * scale,
+        width: node.frame.width * scale,
+        height: node.frame.height * scale,
+      }
+
+      return {
+        ...node,
+        frame: scaledFrame,
+        text: node.text
+          ? {
+              ...node.text,
+              fontSize: node.text.fontSize * scale,
+              lineHeight: node.text.lineHeight * scale,
+              letterSpacing: node.text.letterSpacing * scale,
+              box: {
+                width: scaledFrame.width,
+                height: scaledFrame.height,
+              },
+            }
+          : undefined,
+        clip:
+          node.clip?.radius?.length
+            ? {
+                ...node.clip,
+                radius: node.clip.radius.map((value) => value * scale),
+              }
+            : node.clip,
+      }
+    }),
+  }
+}
+
+function ensureSceneFitsArtboard(scene: SceneDocument, padding = 24) {
+  const bounds = sceneContentBounds(scene)
+  if (!bounds) {
+    return scene
+  }
+
+  const requiredWidth = Math.max(scene.artboard.width, bounds.x + bounds.width + padding)
+  const requiredHeight = Math.max(scene.artboard.height, bounds.y + bounds.height + padding)
+
+  if (
+    Math.abs(requiredWidth - scene.artboard.width) < 1 &&
+    Math.abs(requiredHeight - scene.artboard.height) < 1
+  ) {
+    return scene
+  }
+
+  return {
+    ...scene,
+    artboard: {
+      ...scene.artboard,
+      width: requiredWidth,
+      height: requiredHeight,
+    },
+  }
+}
+
+function rebalanceChartLayering(scene: SceneDocument) {
+  const chartNode = [...scene.nodes]
+    .filter((node) => node.render === 'svg' || node.render === 'canvas')
+    .sort(
+      (left, right) =>
+        right.frame.width * right.frame.height - left.frame.width * left.frame.height,
+    )[0]
+
+  if (!chartNode) {
+    return scene
+  }
+
+  const promotedNodeIds = new Set(
+    scene.nodes
+      .filter((node) => node.id !== chartNode.id)
+      .filter((node) => node.type === 'text' || /(legend|swatch|title|axis)/i.test(`${node.id} ${node.name ?? ''}`))
+      .filter((node) => {
+        const overlapsChartTop =
+          node.frame.y + node.frame.height > chartNode.frame.y &&
+          node.frame.y < chartNode.frame.y + 64
+        const outsideChartBand =
+          node.frame.y < chartNode.frame.y || node.frame.x < chartNode.frame.x - 12
+        const belowChart = node.frame.y >= chartNode.frame.y + chartNode.frame.height - 8
+
+        return overlapsChartTop || outsideChartBand || belowChart
+      })
+      .map((node) => node.id),
+  )
+
+  if (!promotedNodeIds.size) {
+    return scene
+  }
+
+  const baseZIndex = Math.max(chartNode.zIndex + 1, ...scene.nodes.map((node) => node.zIndex))
+
+  return {
+    ...scene,
+    nodes: scene.nodes.map((node) => {
+      if (node.id === chartNode.id) {
+        return {
+          ...node,
+          zIndex: Math.min(node.zIndex, 1),
+        }
+      }
+
+      if (!promotedNodeIds.has(node.id)) {
+        return node
+      }
+
+      return {
+        ...node,
+        zIndex: Math.max(node.zIndex, baseZIndex + 1),
+      }
+    }),
+  }
+}
+
+function extractSvgTextContent(svgMarkup: string) {
+  const contents = new Set<string>()
+  const matches = svgMarkup.matchAll(/<text\b[^>]*>(.*?)<\/text>/gis)
+
+  for (const match of matches) {
+    const value = match[1]?.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim()
+    if (value) {
+      contents.add(value)
+    }
+  }
+
+  return contents
+}
+
+function dedupeChartTextNodes(scene: SceneDocument) {
+  const svgTextContents = new Set<string>()
+
+  for (const node of scene.nodes) {
+    if (typeof node.svg === 'string') {
+      for (const content of extractSvgTextContent(node.svg)) {
+        svgTextContents.add(content)
+      }
+    }
+  }
+
+  if (!svgTextContents.size) {
+    return scene
+  }
+
+  const dedupedNodes = scene.nodes.filter((node) => {
+    if (!node.text?.content) {
+      return true
+    }
+
+    const normalizedText = node.text.content.replace(/\s+/g, ' ').trim()
+    if (!svgTextContents.has(normalizedText)) {
+      return true
+    }
+
+    return !/(axis|tick|label|title|坐标|刻度|标签)/i.test(`${node.id} ${node.name ?? ''}`)
+  })
+
+  if (dedupedNodes.length === scene.nodes.length) {
+    return scene
+  }
+
+  const remainingIds = new Set(dedupedNodes.map((node) => node.id))
+  return {
+    ...scene,
+    nodes: dedupedNodes,
+    constraints: scene.constraints.filter((constraint) => {
+      if (constraint.nodeId && !remainingIds.has(constraint.nodeId)) {
+        return false
+      }
+
+      if (constraint.nodes?.length) {
+        const filtered = constraint.nodes.filter((nodeId) => remainingIds.has(nodeId))
+        constraint.nodes = filtered
+        return filtered.length > 0
+      }
+
+      return true
+    }),
+  }
+}
+
+function parseScenePayload(sceneJson: string) {
+  try {
+    return JSON.parse(sceneJson) as SceneDocument
+  } catch {
+    return JSON.parse(jsonrepair(sceneJson)) as SceneDocument
+  }
+}
+
+function scoreStage(metrics: StageMetrics) {
+  return (
+    metrics.visualSimilarity -
+    metrics.criticalIssueCount * 0.08 -
+    metrics.overflowCount * 0.04 -
+    metrics.occlusionCount * 0.04 -
+    metrics.missingNodeCount * 0.05 -
+    metrics.alignmentErrorP95 * 0.002
+  )
+}
+
+function isSuccess(metrics: StageMetrics) {
+  return (
+    metrics.visualSimilarity >= pipelineDefaults.minSuccessSimilarity &&
+    metrics.criticalIssueCount === 0 &&
+    metrics.overflowCount === 0 &&
+    metrics.occlusionCount === 0 &&
+    metrics.missingNodeCount === 0
+  )
+}
+
+function stageDeltaSummary(previous: StageArtifact | undefined, current: StageArtifact) {
+  if (!previous) {
+    return '初稿渲染'
+  }
+
+  const issueDelta = previous.repairReport.issues.length - current.repairReport.issues.length
+  const similarityDelta = current.metrics.visualSimilarity - previous.metrics.visualSimilarity
+  return `修复 ${Math.max(issueDelta, 0)} 项 · 相似度 ${
+    similarityDelta >= 0 ? '+' : ''
+  }${similarityDelta.toFixed(3)}`
+}
+
+function buildTaskSummary(params: {
+  taskId: string
+  createdAt: string
+  inputImage: string
+  stages: StageArtifact[]
+  bestStage?: StageArtifact
+  status: 'running' | 'completed'
+  exitReason?: ExitReason
+  activeStepLabel?: string
+  runningStage?: {
+    index: number
+    name: string
+    placeholderMessage: string
+  }
+}): TaskTimelineSummary {
+  const completedStages: TaskSummaryStage[] = params.stages.map((stage, index) => ({
+    index: stage.index,
+    name: stage.name,
+    status: 'completed' as const,
+    screenshot: toPublicRelative(stage.screenshotPath),
+    deltaSummary: stageDeltaSummary(params.stages[index - 1], stage),
+    renderMode: stage.renderMode,
+    metrics: stage.metrics,
+    debug: stage.debugStats,
+    hidden: {
+      code: toPublicRelative(stage.componentPath),
+      repairReport: toPublicRelative(stage.repairReportPath),
+      diffTarget: toPublicRelative(stage.diffTargetPath),
+      diffPrev: stage.diffPrevPath ? toPublicRelative(stage.diffPrevPath) : undefined,
+      domSnapshot: toPublicRelative(stage.domSnapshotPath),
+    },
+  }))
+
+  if (params.runningStage) {
+    completedStages.push({
+      index: params.runningStage.index,
+      name: params.runningStage.name,
+      status: 'running',
+      deltaSummary: params.runningStage.placeholderMessage,
+      placeholderMessage: params.runningStage.placeholderMessage,
+    })
+  }
+
+  return {
+    taskId: params.taskId,
+    createdAt: params.createdAt,
+    updatedAt: new Date().toISOString(),
+    status: params.status,
+    inputImage: params.inputImage,
+    finalComponent: params.bestStage ? toPublicRelative(params.bestStage.componentPath) : undefined,
+    exitReason: params.exitReason,
+    activeStepLabel: params.activeStepLabel,
+    bestStageIndex: params.bestStage?.index ?? 0,
+    finalStageIndex: params.stages.at(-1)?.index ?? 0,
+    stages: completedStages,
+  }
+}
+
+function buildReasons(metrics: StageMetrics, exitReason: ExitReason) {
+  if (exitReason === 'success') {
+    return ['达到收敛阈值，当前最佳版本满足默认验收标准。']
+  }
+
+  const reasons: string[] = [`任务以 ${exitReason} 退出。`]
+  if (metrics.visualSimilarity < pipelineDefaults.minSuccessSimilarity) {
+    reasons.push(
+      `视觉相似度 ${(metrics.visualSimilarity * 100).toFixed(1)}% 低于阈值 ${(pipelineDefaults.minSuccessSimilarity * 100).toFixed(1)}%。`,
+    )
+  }
+  if (metrics.overflowCount > 0) {
+    reasons.push(`仍存在 ${metrics.overflowCount} 处文本溢出。`)
+  }
+  if (metrics.occlusionCount > 0) {
+    reasons.push(`仍存在 ${metrics.occlusionCount} 处遮挡问题。`)
+  }
+  if (metrics.missingNodeCount > 0) {
+    reasons.push(`仍缺少 ${metrics.missingNodeCount} 个关键节点。`)
+  }
+  if (metrics.criticalIssueCount > 0) {
+    reasons.push(`仍有 ${metrics.criticalIssueCount} 个严重问题未解决。`)
+  }
+  return reasons
+}
+
+function detectChartLikeScene(scene: SceneDocument, promptText?: string) {
+  if (promptText && /(chart|graph|bar|line|pie|柱状图|折线图|图表|坐标轴)/i.test(promptText)) {
+    return true
+  }
+
+  return scene.nodes.some((node) =>
+    /(chart|graph|plot|axis|legend|bar|series|grid|month|图表|图例|坐标轴)/i.test(
+      `${node.id} ${node.name ?? ''} ${node.type}`,
+    ),
+  )
+}
+
+function hasRenderableChartPayload(scene: SceneDocument, renderPreference: RenderPreference) {
+  const svgNodes = scene.nodes.filter(
+    (node) => node.render === 'svg' && typeof node.svg === 'string' && node.svg.includes('<svg'),
+  )
+  const canvasNodes = scene.nodes.filter((node) => node.render === 'canvas')
+
+  if (renderPreference === 'canvas') {
+    return canvasNodes.length > 0
+  }
+
+  return svgNodes.length > 0 || canvasNodes.length > 0
+}
+
+function detectStageRenderMode(componentSource: string, scene: SceneDocument): RenderMode {
+  if (/<canvas[\s>]/i.test(componentSource) || scene.nodes.some((node) => node.render === 'canvas')) {
+    return 'canvas'
+  }
+
+  if (
+    /<svg[\s>]/i.test(componentSource) ||
+    scene.nodes.some((node) => node.render === 'svg' || typeof node.svg === 'string')
+  ) {
+    return 'svg'
+  }
+
+  return 'html'
+}
+
+function isUsableScene(scene: SceneDocument, renderPreference: RenderPreference, promptText?: string) {
+  const meaningfulNodes = scene.nodes.filter((node) => node.type !== 'frame')
+  const textNodes = scene.nodes.filter((node) => node.type === 'text')
+  const baseValidity = scene.nodes.length >= 4 && meaningfulNodes.length >= 2 && textNodes.length >= 1
+
+  if (!baseValidity) {
+    return false
+  }
+
+  if (detectChartLikeScene(scene, promptText)) {
+    return hasRenderableChartPayload(scene, renderPreference)
+  }
+
+  return true
+}
+
+export async function runTask(options: { imagePath: string; promptText?: string }): Promise<TaskResult> {
+  const sourceImagePath = path.resolve(options.imagePath)
+  const renderPreference = extractRenderPreference(options.promptText)
+
+  if (!(await fileExists(sourceImagePath))) {
+    throw new Error(`输入图片不存在: ${sourceImagePath}`)
+  }
+
+  await ensureArtifactsLayout()
+
+  const metadata = await sharp(sourceImagePath).metadata()
+  const width = metadata.width ?? 1200
+  const height = metadata.height ?? 800
+  const extension = path.extname(sourceImagePath) || '.png'
+  const taskId = createTaskId()
+  const createdAt = new Date().toISOString()
+  const taskPaths = await prepareTaskDirectories(taskId)
+  const sourceCopyPath = path.join(taskPaths.sourceRoot, `source${extension}`)
+  const modelImagePath = path.join(taskPaths.sourceRoot, 'analysis-input.jpg')
+  const codex = new CodexCliClient()
+  const renderer = new StageRenderer()
+  const referenceBounds = await detectForegroundBounds(sourceImagePath)
+  const stages: StageArtifact[] = []
+  const issueHistory = new Map<string, number>()
+  const startTime = Date.now()
+  let noProgressRounds = 0
+  let exitReason: ExitReason = 'max_iterations'
+  let bestStage: StageArtifact | undefined
+  let latestStage: StageArtifact | undefined
+
+  await fs.copyFile(sourceImagePath, sourceCopyPath)
+  await sharp(sourceImagePath)
+    .resize({
+      width: 640,
+      height: 640,
+      fit: 'inside',
+      withoutEnlargement: true,
+    })
+    .jpeg({
+      quality: 88,
+    })
+    .toFile(modelImagePath)
+  await writeJson(taskPaths.metaPath, {
+    taskId,
+    createdAt,
+    sourceImagePath,
+    modelImagePath,
+    promptText: options.promptText ?? '',
+    renderPreference,
+    config: pipelineDefaults,
+  })
+  await updateTimeline(
+    buildTaskSummary({
+      taskId,
+      createdAt,
+      inputImage: toPublicRelative(sourceCopyPath),
+      stages,
+      status: 'running',
+      activeStepLabel: 'scene 解析中',
+    }),
+  )
+  await appendEvent(taskId, {
+    type: 'task_started',
+    taskId,
+    createdAt,
+    sourceImagePath,
+    renderPreference,
+  })
+
+  try {
+    await renderer.start()
+
+    let scene: SceneDocument | undefined
+    let sceneResponseSummary = ''
+
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      const sceneResponse = await codex.runStructured<{
+        summary: string
+        scene_json: string
+      }>({
+        label: `scene-${attempt}`,
+        prompt: createScenePrompt(
+          toPublicRelative(sourceCopyPath),
+          width,
+          height,
+          renderPreference,
+          options.promptText,
+        ),
+        schema: sceneResponseSchema,
+        imagePaths: [modelImagePath],
+      })
+
+      const candidateScene = normalizeScene(
+        parseScenePayload(sceneResponse.scene_json),
+        toPublicRelative(sourceCopyPath),
+        width,
+        height,
+      )
+      const scaledScene = scaleSceneToSourceIfNeeded(candidateScene, width, height)
+      const fittedScene = rebalanceChartLayering(
+        dedupeChartTextNodes(
+          ensureSceneFitsArtboard(fitSceneToReferenceBounds(scaledScene, referenceBounds)),
+        ),
+      )
+
+      if (isUsableScene(fittedScene, renderPreference, options.promptText)) {
+        scene = fittedScene
+        sceneResponseSummary = sceneResponse.summary
+        break
+      }
+
+      await appendEvent(taskId, {
+        type: 'scene_rejected',
+        taskId,
+        attempt,
+        nodeCount: fittedScene.nodes.length,
+        renderPreference,
+      })
+    }
+
+    if (!scene) {
+      throw new Error('scene 解析未产出有效节点，任务已中止。')
+    }
+
+    scene.summary = sceneResponseSummary
+    await writeJson(path.join(taskPaths.taskRoot, 'scene.json'), scene)
+
+    let workingComponent = buildFallbackComponent(scene)
+    let nextStageName = 'draft'
+
+    for (let iteration = 1; iteration <= pipelineDefaults.maxIterations; iteration += 1) {
+      const stageName = iteration === 1 ? 'draft' : slugify(nextStageName || `repair-${iteration}`)
+      const stageDirectory = path.join(taskPaths.stagesRoot, getStageDirectoryName(iteration, stageName))
+
+      await ensureDir(stageDirectory)
+      await updateTimeline(
+        buildTaskSummary({
+          taskId,
+          createdAt,
+          inputImage: toPublicRelative(sourceCopyPath),
+          stages,
+          bestStage,
+          status: 'running',
+          activeStepLabel: `${stageName} 进行中`,
+          runningStage: {
+            index: iteration,
+            name: stageName,
+            placeholderMessage: '正在生成组件、渲染截图并执行检测…',
+          },
+        }),
+      )
+
+      const componentPath = path.join(stageDirectory, 'component.vue')
+      const screenshotPath = path.join(stageDirectory, 'render.png')
+      const diffTargetPath = path.join(stageDirectory, 'diff-target.png')
+      const diffPrevPath = latestStage ? path.join(stageDirectory, 'diff-prev.png') : undefined
+      const repairReportPath = path.join(stageDirectory, 'repair-report.json')
+      const metricsPath = path.join(stageDirectory, 'metrics.json')
+      const debugPath = path.join(stageDirectory, 'debug-stats.json')
+      const domSnapshotPath = path.join(stageDirectory, 'dom-snapshot.json')
+
+      await writeText(componentPath, `${workingComponent}\n`)
+
+      const render = await renderer.renderStage({
+        taskId,
+        stageId: getStageDirectoryName(iteration, stageName),
+        componentSource: workingComponent,
+        scene,
+        screenshotPath,
+        domSnapshotPath,
+      })
+
+      const analysis = await analyzeStage({
+        scene,
+        referenceImagePath: sourceCopyPath,
+        render,
+        diffTargetPath,
+        diffPrevPath,
+        previousScreenshotPath: latestStage?.screenshotPath,
+      })
+
+      const stage: StageArtifact = {
+        index: iteration,
+        name: stageName,
+        directory: stageDirectory,
+        componentPath,
+        screenshotPath,
+        diffTargetPath,
+        diffPrevPath,
+        repairReportPath,
+        metricsPath,
+        debugPath,
+        domSnapshotPath,
+        componentSource: workingComponent,
+        render,
+        repairReport: analysis.repairReport,
+        metrics: analysis.metrics,
+        renderMode: {
+          preference: renderPreference,
+          actual: detectStageRenderMode(workingComponent, scene),
+        },
+        debugStats: undefined,
+        score: scoreStage(analysis.metrics),
+      }
+
+      stage.debugStats = computeDebugStats(latestStage, stage)
+
+      await writeJson(repairReportPath, stage.repairReport)
+      await writeJson(metricsPath, stage.metrics)
+      await writeJson(debugPath, stage.debugStats ?? {})
+
+      stages.push(stage)
+      latestStage = stage
+
+      if (!bestStage || stage.score > bestStage.score) {
+        bestStage = stage
+      }
+
+      for (const issue of stage.repairReport.issues) {
+        issueHistory.set(issue.signature, (issueHistory.get(issue.signature) ?? 0) + 1)
+      }
+
+      await appendEvent(taskId, {
+        type: 'stage_completed',
+        taskId,
+        stageIndex: iteration,
+        stageName,
+        metrics: stage.metrics,
+        debug: stage.debugStats,
+      })
+      await updateTimeline(
+        buildTaskSummary({
+          taskId,
+          createdAt,
+          inputImage: toPublicRelative(sourceCopyPath),
+          stages,
+          bestStage,
+          status: 'running',
+          activeStepLabel: '分析修复建议中',
+        }),
+      )
+
+      if (isSuccess(stage.metrics)) {
+        exitReason = 'success'
+        break
+      }
+
+      if (Date.now() - startTime > pipelineDefaults.maxDurationMs) {
+        exitReason = 'max_duration'
+        break
+      }
+
+      const previousStage = stages[stages.length - 2]
+      const visualGain = previousStage
+        ? stage.metrics.visualSimilarity - previousStage.metrics.visualSimilarity
+        : stage.metrics.visualSimilarity
+      const criticalImproved =
+        previousStage && previousStage.metrics.criticalIssueCount > stage.metrics.criticalIssueCount
+
+      if (visualGain < pipelineDefaults.minVisualGain && !criticalImproved) {
+        noProgressRounds += 1
+      } else {
+        noProgressRounds = 0
+      }
+
+      if (noProgressRounds >= pipelineDefaults.maxNoProgressRounds) {
+        exitReason = 'no_progress'
+        break
+      }
+
+      if (
+        stages.length >= 3 &&
+        stage.render.renderHash === stages[stages.length - 3]?.render.renderHash
+      ) {
+        exitReason = 'oscillation_detected'
+        break
+      }
+
+      if ([...issueHistory.values()].some((count) => count >= pipelineDefaults.maxSameIssueRepeats)) {
+        exitReason = 'same_issue_repeated'
+        break
+      }
+
+      if (
+        previousStage &&
+        stage.metrics.criticalIssueCount > previousStage.metrics.criticalIssueCount &&
+        stage.metrics.visualSimilarity < previousStage.metrics.visualSimilarity - 0.01
+      ) {
+        exitReason = 'regression_detected'
+        break
+      }
+
+      if (iteration >= pipelineDefaults.maxIterations) {
+        exitReason = 'max_iterations'
+        break
+      }
+
+      try {
+        const baseStage = bestStage && bestStage.score > stage.score ? bestStage : stage
+        const repair = await codex.runStructured<ComponentResponse>({
+          label: `repair-${iteration}`,
+          prompt: createRepairPrompt(
+            scene,
+            baseStage,
+            stage.repairReport,
+            renderPreference,
+            bestStage,
+          ),
+          schema: componentResponseSchema,
+        })
+        workingComponent = ensureRenderableSfc(repair.component, scene)
+        nextStageName = repair.summary || `repair-${iteration + 1}`
+      } catch (error) {
+        await appendEvent(taskId, {
+          type: 'repair_failed',
+          taskId,
+          stageIndex: iteration,
+          error: error instanceof Error ? error.message : String(error),
+        })
+        workingComponent = buildFallbackComponent(scene)
+        nextStageName = `fallback-${iteration + 1}`
+      }
+    }
+  } catch (error) {
+    await appendEvent(taskId, {
+      type: 'task_failed',
+      taskId,
+      error: error instanceof Error ? error.message : String(error),
+    })
+
+    if (!bestStage) {
+      await updateTimeline(
+        buildTaskSummary({
+          taskId,
+          createdAt,
+          inputImage: toPublicRelative(sourceCopyPath),
+          stages,
+          status: 'completed',
+          exitReason: 'model_error',
+        }),
+      )
+      throw error
+    }
+
+    exitReason = 'render_error'
+  } finally {
+    await renderer.stop()
+  }
+
+  if (!bestStage) {
+    throw new Error('任务未能产生任何阶段输出')
+  }
+
+  const summary: TaskTimelineSummary = {
+    ...buildTaskSummary({
+      taskId,
+      createdAt,
+      inputImage: toPublicRelative(sourceCopyPath),
+      stages,
+      bestStage,
+      status: 'completed',
+      exitReason,
+    }),
+  }
+
+  const aggregateDebug = {
+    taskId,
+    summary: {
+      totalStages: stages.length,
+      bestStage: bestStage.index,
+      overallAdherenceRate:
+        stages
+          .map((stage) => stage.debugStats?.overallAdherenceRate)
+          .filter((value): value is number => typeof value === 'number')
+          .reduce((sum, value, _, array) => sum + value / array.length, 0) || 1,
+    },
+    stages: stages
+      .filter((stage) => stage.debugStats)
+      .map((stage) => ({
+        stageIndex: stage.index,
+        fromStage: stage.index - 1,
+        toStage: stage.index,
+        scores: stage.debugStats,
+      })),
+  }
+
+  await writeJson(taskPaths.debugStatsPath, aggregateDebug)
+  await writeJson(taskPaths.issueHistoryPath, Object.fromEntries(issueHistory.entries()))
+  await writeJson(taskPaths.metaPath, {
+    ...(await readJson<Record<string, unknown>>(taskPaths.metaPath)),
+    exitReason,
+    bestStageIndex: bestStage.index,
+    finalStageIndex: stages.at(-1)?.index ?? bestStage.index,
+    metExpectation: isSuccess(bestStage.metrics),
+  })
+
+  await updateTimeline(summary)
+  await appendEvent(taskId, {
+    type: 'task_finished',
+    taskId,
+    exitReason,
+    bestStageIndex: bestStage.index,
+  })
+
+  return {
+    taskId,
+    exitReason,
+    summary,
+    bestStage,
+    stages,
+    metExpectation: isSuccess(bestStage.metrics),
+    reasons: buildReasons(bestStage.metrics, exitReason),
+  }
+}
