@@ -39,6 +39,7 @@ export function createScenePrompt(
   width: number,
   height: number,
   renderPreference: RenderPreference,
+  ocrHint?: string,
   promptText?: string,
 ) {
   return `
@@ -58,6 +59,14 @@ ${projectMemoryInstructions()}
 渲染偏好：
 ${renderPreferenceInstructions(renderPreference, promptText)}
 
+OCR 辅助信息：
+${
+  ocrHint
+    ? `- 以下信息由 OCR 高置信提取，请优先用于标题、图例、坐标轴、刻度、徽标、标签等可见文本内容与大致位置：
+${ocrHint}`
+    : '- 本轮没有可用 OCR 结果，请自行识别文本。'
+}
+
 硬性要求：
 - 只输出符合 schema 的 JSON。
 - schema 中的 \`scene_json\` 字段必须是完整 scene 文档的 JSON 字符串，而不是自然语言解释。
@@ -75,6 +84,68 @@ ${renderPreferenceInstructions(renderPreference, promptText)}
 - 如果主图表选择 svg，主图表节点必须包含可直接渲染的 \`svg\` 内容。
 
 请保持结构尽量简洁，但不要省略会影响对齐、溢出、遮挡判断的字段。
+  `.trim()
+}
+
+export function createChartSpecPrompt(
+  width: number,
+  height: number,
+  renderPreference: RenderPreference,
+  ocrHint?: string,
+  promptText?: string,
+) {
+  return `
+你是一个严格的图表结构提取器。请根据附图提取可用于高保真重建的 chart spec。
+
+${projectMemoryInstructions()}
+
+目标：
+- 这一步不是直接生成 Vue 代码，而是提取足够稳定的图表结构，供后续 scene 构建和组件生成使用。
+- 重点识别图例、坐标轴、刻度、类别、系列颜色、每个系列的数据点或柱状值。
+- 数值允许是视觉估计值，但必须和图中几何关系一致，不能凭空捏造不存在的系列或标签。
+- 保持输出紧凑，只输出 JSON。
+- 图表主内容优先服务于 ${renderPreference} 重建；如果图中是柱状图、折线图、面积图等，请明确 subtype。
+
+图像尺寸：
+- width: ${width}
+- height: ${height}
+
+渲染偏好：
+${renderPreferenceInstructions(renderPreference, promptText)}
+
+OCR 辅助信息：
+${
+  ocrHint
+    ? `- 以下信息由 OCR 高置信提取，请优先用于图例、轴标签、刻度和类别文本：
+${ocrHint}`
+    : '- 本轮没有可用 OCR 结果，请自行识别文本。'
+}
+
+输出要求：
+- 只输出 JSON，不要 markdown，不要解释。
+- JSON 字段固定为：
+{
+  "type": "chart",
+  "subtype": "bar|line|area|pie|scatter|other",
+  "title": "",
+  "xAxis": { "label": "", "categories": [] },
+  "yAxis": { "label": "", "min": 0, "max": 0, "step": 0 },
+  "series": [
+    { "name": "", "color": "#000000", "data": [] }
+  ],
+  "legend": {
+    "items": [
+      { "name": "", "color": "#000000" }
+    ]
+  }
+}
+
+硬性要求：
+- 所有颜色使用十六进制。
+- series.data 长度必须和 xAxis.categories 长度一致。
+- 如果图中没有 title，title 为空字符串。
+- 如果无法确定 min/max/step，请给出最贴近图中刻度的估计值。
+- 不要输出 scene.json，不要输出节点树。
   `.trim()
 }
 
@@ -112,6 +183,7 @@ export function createRepairPrompt(
   stage: StageArtifact,
   report: RepairReport,
   renderPreference: RenderPreference,
+  ocrHint?: string,
   bestStage?: StageArtifact,
 ) {
   return `
@@ -127,6 +199,7 @@ ${projectMemoryInstructions()}
 - 不要改动未被点名的节点，除非为了修复遮挡/层级必须连带调整。
 - 不要移除已经正确工作的结构。
 - 当前渲染偏好：${renderPreference}。
+- 如果 OCR 提供了文本提示，优先保证标题、图例、坐标轴、刻度和标签与 OCR 一致。
 
 修复目标：
 - 先处理 critical/high 问题。
@@ -142,6 +215,13 @@ ${stage.componentSource}
 
 repair-report:
 ${JSON.stringify(report, null, 2)}
+
+${
+  ocrHint
+    ? `OCR 文本提示（高置信）:
+${ocrHint}`
+    : '本轮没有可用 OCR 文本提示。'
+}
 
 ${
   bestStage

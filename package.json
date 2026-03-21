@@ -10,6 +10,7 @@
     "task:run": "tsx scripts/run-task.ts",
     "task:verify": "tsx scripts/verify-task.ts",
     "qwen:test": "tsx scripts/test-qwen-vl.ts",
+    "qwen:ocr:test": "tsx scripts/test-qwen-ocr.ts",
     "playwright:install": "playwright install chromium"
   },
   "dependencies": {

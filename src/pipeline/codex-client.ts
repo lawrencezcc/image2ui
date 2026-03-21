@@ -23,8 +23,8 @@ function runProcess(args: string[], input: string, cwd: string) {
     })
     const timeout = setTimeout(() => {
       child.kill('SIGTERM')
-      reject(new Error(`Codex 命令执行超时，已在 45000ms 后中止。`))
-    }, 45_000)
+      reject(new Error(`Codex 命令执行超时，已在 ${codexConfig.timeoutMs}ms 后中止。`))
+    }, codexConfig.timeoutMs)
 
     let stdout = ''
     let stderr = ''

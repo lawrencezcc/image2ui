@@ -51,6 +51,7 @@ export const projectMemory = {
 export const codexConfig = {
   bin: process.env.CODEX_BIN ?? 'codex',
   model: process.env.CODEX_MODEL ?? 'gpt-5.4-mini',
+  timeoutMs: Number(process.env.CODEX_TIMEOUT_MS ?? '90000'),
 }
 
 export const qwenVlConfig = {
@@ -58,4 +59,15 @@ export const qwenVlConfig = {
   baseURL: process.env.DASHSCOPE_BASE_URL ?? 'https://dashscope.aliyuncs.com/compatible-mode/v1',
   model: process.env.QWEN_VL_MODEL ?? 'qwen3-vl-235b-a22b-instruct',
   timeoutMs: Number(process.env.QWEN_VL_TIMEOUT_MS ?? '120000'),
+}
+
+export const qwenOcrConfig = {
+  apiKeyEnv: 'DASHSCOPE_API_KEY',
+  baseURL:
+    process.env.QWEN_OCR_BASE_URL ??
+    'https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation',
+  model: process.env.QWEN_OCR_MODEL ?? 'qwen-vl-ocr',
+  timeoutMs: Number(process.env.QWEN_OCR_TIMEOUT_MS ?? '120000'),
+  minPixels: Number(process.env.QWEN_OCR_MIN_PIXELS ?? `${32 * 32 * 3}`),
+  maxPixels: Number(process.env.QWEN_OCR_MAX_PIXELS ?? `${32 * 32 * 8192}`),
 }

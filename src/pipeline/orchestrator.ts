@@ -5,11 +5,14 @@ import { jsonrepair } from 'jsonrepair'
 import sharp from 'sharp'
 
 import { analyzeStage } from './analyze'
+import { buildSceneFromChartSpec } from './chart-scene'
 import { pipelineDefaults } from './config'
 import { CodexCliClient } from './codex-client'
 import { computeDebugStats } from './debug-stats'
 import { buildFallbackComponent, isRenderableSfc } from './fallback'
-import { createRepairPrompt, createScenePrompt } from './prompting'
+import { createChartSpecPrompt, createRepairPrompt, createScenePrompt } from './prompting'
+import { QwenOcrClient } from './qwen-ocr-client'
+import { QwenVlClient } from './qwen-vl-client'
 import { StageRenderer } from './render'
 import { componentResponseSchema, sceneResponseSchema } from './schemas'
 import {
@@ -795,10 +798,55 @@ function dedupeChartTextNodes(scene: SceneDocument) {
 
 function parseScenePayload(sceneJson: string) {
   try {
-    return JSON.parse(sceneJson) as SceneDocument
+    return JSON.parse(sceneJson) as unknown
   } catch {
-    return JSON.parse(jsonrepair(sceneJson)) as SceneDocument
+    return JSON.parse(jsonrepair(sceneJson)) as unknown
   }
+}
+
+function parseLooseJson<T>(text: string) {
+  const fencedMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/i)
+  const candidate = fencedMatch?.[1] ?? text
+
+  try {
+    return JSON.parse(candidate) as T
+  } catch {
+    return JSON.parse(jsonrepair(candidate)) as T
+  }
+}
+
+function parseJsonEnvelope(text: string) {
+  const fencedMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/i)
+  const candidate = fencedMatch?.[1] ?? text
+
+  try {
+    return JSON.parse(candidate) as { summary: string; scene_json: string }
+  } catch {
+    return JSON.parse(jsonrepair(candidate)) as { summary: string; scene_json: string }
+  }
+}
+
+function buildOcrHint(ocrText: string, words: Array<{ text: string; location?: number[] }>) {
+  const lines = ocrText
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .slice(0, 30)
+  const locatedWords = words
+    .slice(0, 24)
+    .map((word) =>
+      word.location?.length
+        ? `${word.text} @ [${word.location.join(', ')}]`
+        : word.text,
+    )
+
+  return [
+    lines.length ? `OCR 文本行:\n- ${lines.join('\n- ')}` : '',
+    locatedWords.length ? `OCR 位置线索:\n- ${locatedWords.join('\n- ')}` : '',
+  ]
+    .filter(Boolean)
+    .join('\n')
+    .trim()
 }
 
 function scoreStage(metrics: StageMetrics) {
@@ -958,12 +1006,46 @@ function detectStageRenderMode(componentSource: string, scene: SceneDocument): R
   return 'html'
 }
 
+function isChartLikeInput(promptText: string | undefined, ocrWords: Array<{ text: string }>) {
+  if (promptText && /(chart|graph|bar|line|area|pie|柱状图|折线图|面积图|图表|坐标轴)/i.test(promptText)) {
+    return true
+  }
+
+  const monthCount = ocrWords.filter((word) => /^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\.?$/i.test(word.text)).length
+  const numericCount = ocrWords.filter((word) => /^-?\d+(?:\.\d+)?$/.test(word.text)).length
+  const axisKeywordCount = ocrWords.filter((word) => /(量|率|值|月份|日期|year|month|day|week)/i.test(word.text)).length
+
+  return monthCount >= 3 || (numericCount >= 3 && axisKeywordCount >= 1)
+}
+
+function hasTooManyZeroSizedTextNodes(scene: SceneDocument) {
+  const textNodes = scene.nodes.filter((node) => node.type === 'text')
+  if (!textNodes.length) {
+    return false
+  }
+
+  const zeroSizedCount = textNodes.filter((node) => node.frame.width <= 1 || node.frame.height <= 1).length
+  return zeroSizedCount / textNodes.length >= 0.6
+}
+
+function hasDegenerateRenderableNode(scene: SceneDocument) {
+  return scene.nodes.some(
+    (node) =>
+      (node.render === 'svg' || node.render === 'canvas') &&
+      (node.frame.width <= 1 || node.frame.height <= 1),
+  )
+}
+
 function isUsableScene(scene: SceneDocument, renderPreference: RenderPreference, promptText?: string) {
   const meaningfulNodes = scene.nodes.filter((node) => node.type !== 'frame')
   const textNodes = scene.nodes.filter((node) => node.type === 'text')
   const baseValidity = scene.nodes.length >= 4 && meaningfulNodes.length >= 2 && textNodes.length >= 1
 
   if (!baseValidity) {
+    return false
+  }
+
+  if (hasDegenerateRenderableNode(scene) || hasTooManyZeroSizedTextNodes(scene)) {
     return false
   }
 
@@ -994,6 +1076,8 @@ export async function runTask(options: { imagePath: string; promptText?: string 
   const sourceCopyPath = path.join(taskPaths.sourceRoot, `source${extension}`)
   const modelImagePath = path.join(taskPaths.sourceRoot, 'analysis-input.jpg')
   const codex = new CodexCliClient()
+  const qwenOcr = new QwenOcrClient()
+  const qwenVl = new QwenVlClient()
   const renderer = new StageRenderer()
   const referenceBounds = await detectForegroundBounds(sourceImagePath)
   const stages: StageArtifact[] = []
@@ -1048,50 +1132,203 @@ export async function runTask(options: { imagePath: string; promptText?: string 
 
     let scene: SceneDocument | undefined
     let sceneResponseSummary = ''
+    let ocrHint = ''
+    let ocrWords: Array<{ text: string; location?: number[] }> = []
 
-    for (let attempt = 1; attempt <= 2; attempt += 1) {
-      const sceneResponse = await codex.runStructured<{
-        summary: string
-        scene_json: string
-      }>({
-        label: `scene-${attempt}`,
-        prompt: createScenePrompt(
-          toPublicRelative(sourceCopyPath),
+    try {
+      await updateTimeline(
+        buildTaskSummary({
+          taskId,
+          createdAt,
+          inputImage: toPublicRelative(sourceCopyPath),
+          stages,
+          status: 'running',
+          activeStepLabel: 'ocr 解析中',
+        }),
+      )
+      const ocrResult = await qwenOcr.recognize({
+        imagePaths: [sourceCopyPath],
+        task: 'advanced_recognition',
+      })
+      ocrHint = buildOcrHint(ocrResult.text.slice(0, 4000), ocrResult.words)
+      ocrWords = ocrResult.words
+      await writeJson(path.join(taskPaths.taskRoot, 'ocr.json'), {
+        model: ocrResult.model,
+        requestId: ocrResult.requestId,
+        usage: ocrResult.usage,
+        text: ocrResult.text,
+        words: ocrResult.words,
+      })
+      await appendEvent(taskId, {
+        type: 'ocr_completed',
+        taskId,
+        textLength: ocrResult.text.length,
+        wordCount: ocrResult.words.length,
+        requestId: ocrResult.requestId,
+      })
+    } catch (error) {
+      await appendEvent(taskId, {
+        type: 'ocr_failed',
+        taskId,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+
+    const isChartInput = isChartLikeInput(options.promptText, ocrWords)
+    const scenePrompt = createScenePrompt(
+      toPublicRelative(sourceCopyPath),
+      width,
+      height,
+      renderPreference,
+      ocrHint,
+      options.promptText,
+    )
+
+    if (isChartInput) {
+      try {
+        const chartSpecResponse = await qwenVl.complete({
+          imagePaths: [modelImagePath],
+          prompt: createChartSpecPrompt(width, height, renderPreference, ocrHint, options.promptText),
+        })
+        const chartScene = buildSceneFromChartSpec({
+          rawSpec: parseLooseJson(chartSpecResponse.text),
+          imagePath: toPublicRelative(sourceCopyPath),
           width,
           height,
-          renderPreference,
-          options.promptText,
-        ),
-        schema: sceneResponseSchema,
-        imagePaths: [modelImagePath],
-      })
+          words: ocrWords,
+        })
 
-      const candidateScene = normalizeScene(
-        parseScenePayload(sceneResponse.scene_json),
-        toPublicRelative(sourceCopyPath),
-        width,
-        height,
-      )
-      const scaledScene = scaleSceneToSourceIfNeeded(candidateScene, width, height)
-      const fittedScene = rebalanceChartLayering(
-        dedupeChartTextNodes(
-          ensureSceneFitsArtboard(fitSceneToReferenceBounds(scaledScene, referenceBounds)),
-        ),
-      )
+        if (chartScene && isUsableScene(chartScene, renderPreference, options.promptText)) {
+          scene = chartScene
+          sceneResponseSummary = chartScene.summary ?? 'chart-spec'
+          await appendEvent(taskId, {
+            type: 'scene_selected',
+            taskId,
+            provider: 'qwen-vl',
+            label: 'scene-chart-spec',
+            nodeCount: chartScene.nodes.length,
+          })
+        } else {
+          await appendEvent(taskId, {
+            type: 'scene_rejected',
+            taskId,
+            provider: 'qwen-vl',
+            label: 'scene-chart-spec',
+            nodeCount: chartScene?.nodes.length ?? 0,
+            renderPreference,
+          })
+        }
+      } catch (error) {
+        await appendEvent(taskId, {
+          type: 'scene_provider_failed',
+          taskId,
+          provider: 'qwen-vl',
+          label: 'scene-chart-spec',
+          error: error instanceof Error ? error.message : String(error),
+        })
+      }
+    }
 
-      if (isUsableScene(fittedScene, renderPreference, options.promptText)) {
-        scene = fittedScene
-        sceneResponseSummary = sceneResponse.summary
+    const sceneCandidates = [
+      {
+        provider: 'qwen-vl',
+        label: 'scene-qwen-primary',
+        run: async () =>
+          parseJsonEnvelope(
+            (
+              await qwenVl.complete({
+                imagePaths: [modelImagePath],
+                prompt: `${scenePrompt}\n\n只输出 JSON 对象，格式为 {"summary":"...","scene_json":"..."}。`,
+              })
+            ).text,
+          ),
+      },
+      {
+        provider: 'codex',
+        label: 'scene-1',
+        run: () =>
+          codex.runStructured<{
+            summary: string
+            scene_json: string
+          }>({
+            label: 'scene-1',
+            prompt: scenePrompt,
+            schema: sceneResponseSchema,
+            imagePaths: [modelImagePath],
+          }),
+      },
+      {
+        provider: 'codex',
+        label: 'scene-2',
+        run: () =>
+          codex.runStructured<{
+            summary: string
+            scene_json: string
+          }>({
+            label: 'scene-2',
+            prompt: scenePrompt,
+            schema: sceneResponseSchema,
+            imagePaths: [modelImagePath],
+          }),
+      },
+    ]
+
+    for (const candidate of sceneCandidates) {
+      if (scene) {
         break
       }
 
-      await appendEvent(taskId, {
-        type: 'scene_rejected',
-        taskId,
-        attempt,
-        nodeCount: fittedScene.nodes.length,
-        renderPreference,
-      })
+      try {
+        const sceneResponse = await candidate.run()
+        const rawScene = parseScenePayload(sceneResponse.scene_json)
+        const bridgedScene = buildSceneFromChartSpec({
+          rawSpec: rawScene,
+          imagePath: toPublicRelative(sourceCopyPath),
+          width,
+          height,
+          words: ocrWords,
+        })
+
+        const candidateScene = bridgedScene
+          ? bridgedScene
+          : normalizeScene(rawScene as SceneDocument, toPublicRelative(sourceCopyPath), width, height)
+        const scaledScene = scaleSceneToSourceIfNeeded(candidateScene, width, height)
+        const fittedScene = rebalanceChartLayering(
+          dedupeChartTextNodes(
+            ensureSceneFitsArtboard(fitSceneToReferenceBounds(scaledScene, referenceBounds)),
+          ),
+        )
+
+        if (isUsableScene(fittedScene, renderPreference, options.promptText)) {
+          scene = fittedScene
+          sceneResponseSummary = sceneResponse.summary
+          await appendEvent(taskId, {
+            type: 'scene_selected',
+            taskId,
+            provider: candidate.provider,
+            label: candidate.label,
+            nodeCount: fittedScene.nodes.length,
+          })
+          break
+        }
+
+        await appendEvent(taskId, {
+          type: 'scene_rejected',
+          taskId,
+          provider: candidate.provider,
+          label: candidate.label,
+          nodeCount: fittedScene.nodes.length,
+          renderPreference,
+        })
+      } catch (error) {
+        await appendEvent(taskId, {
+          type: 'scene_provider_failed',
+          taskId,
+          provider: candidate.provider,
+          label: candidate.label,
+          error: error instanceof Error ? error.message : String(error),
+        })
+      }
     }
 
     if (!scene) {
@@ -1280,6 +1517,7 @@ export async function runTask(options: { imagePath: string; promptText?: string 
             baseStage,
             stage.repairReport,
             renderPreference,
+            ocrHint,
             bestStage,
           ),
           schema: componentResponseSchema,
