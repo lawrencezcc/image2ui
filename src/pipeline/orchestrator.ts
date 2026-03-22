@@ -13,7 +13,13 @@ import { computeDebugStats } from './debug-stats'
 import { buildFallbackComponent, isRenderableSfc } from './fallback'
 import { buildInfographicSceneFromOcr } from './infographic-scene'
 import { KimiCodingClient } from './kimi-client'
-import { createChartSpecPrompt, createRepairPrompt, createScenePrompt } from './prompting'
+import {
+  createChartSpecPrompt,
+  createCompactRepairPrompt,
+  createInitialComponentPrompt,
+  createRepairPrompt,
+  createScenePrompt,
+} from './prompting'
 import { QwenOcrClient } from './qwen-ocr-client'
 import { QwenVlClient } from './qwen-vl-client'
 import { StageRenderer } from './render'
@@ -53,6 +59,8 @@ import {
   writeJson,
   writeText,
 } from './utils'
+
+let codexQuotaMode = false
 
 function sanitizeSfc(source: string) {
   const fencedMatch = source.match(/```(?:vue)?\s*([\s\S]*?)```/i)
@@ -1087,6 +1095,83 @@ function detectStageRenderMode(componentSource: string, scene: SceneDocument): R
   return 'html'
 }
 
+function isInfographicInput(promptText?: string) {
+  return /(infographic|信息图|流程图|时间线|阶段卡片|训练计划)/i.test(promptText ?? '')
+}
+
+function shouldUseCompactRepair(
+  scene: SceneDocument,
+  stage: StageArtifact,
+  renderPreference: RenderPreference,
+) {
+  if (renderPreference === 'canvas') {
+    return true
+  }
+
+  const geometrySensitiveIssues = stage.repairReport.issues.some((issue) =>
+    ['chart_shape_mismatch', 'color_mismatch', 'visual_mismatch'].includes(issue.type),
+  )
+
+  const chartNode = scene.nodes.find((node) => node.render === 'canvas' || node.render === 'svg')
+  const lineLikeCanvas =
+    chartNode?.canvas &&
+    ['line', 'area', 'radar', 'scatter', 'donut', 'pie'].includes(chartNode.canvas.kind)
+  const lineLikeSvg =
+    chartNode?.render === 'svg' &&
+    typeof chartNode.svg === 'string' &&
+    (/<polyline/i.test(chartNode.svg) || /<path/i.test(chartNode.svg)) &&
+    !/<rect/i.test(chartNode.svg)
+
+  return geometrySensitiveIssues || Boolean(lineLikeCanvas) || Boolean(lineLikeSvg)
+}
+
+function shouldUseKimiRepairFallback(
+  scene: SceneDocument,
+  stage: StageArtifact,
+  renderPreference: RenderPreference,
+  infographicInput: boolean,
+) {
+  if (infographicInput || renderPreference === 'canvas') {
+    return true
+  }
+
+  if (
+    stage.repairReport.issues.some((issue) =>
+      ['chart_shape_mismatch', 'visual_mismatch'].includes(issue.type),
+    )
+  ) {
+    return true
+  }
+
+  const chartNode = scene.nodes.find((node) => node.render === 'canvas' || node.render === 'svg')
+  if (chartNode?.canvas) {
+    return ['line', 'area', 'radar', 'scatter', 'donut', 'pie'].includes(chartNode.canvas.kind)
+  }
+
+  return Boolean(
+    chartNode?.render === 'svg' &&
+      typeof chartNode.svg === 'string' &&
+      (/<polyline/i.test(chartNode.svg) || /<path/i.test(chartNode.svg)) &&
+      !/<rect/i.test(chartNode.svg),
+  )
+}
+
+function isCodexQuotaOrAvailabilityError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error)
+  return /(usage limit|purchase more credits|quota|rate limit|service unavailable|temporarily unavailable)/i.test(
+    message,
+  )
+}
+
+function recordCodexQuotaMode(error: unknown) {
+  if (isCodexQuotaOrAvailabilityError(error)) {
+    codexQuotaMode = true
+    return true
+  }
+
+  return false
+}
+
 function isChartLikeInput(promptText: string | undefined, ocrWords: Array<{ text: string }>) {
   if (promptText && /(infographic|信息图|流程图|时间线|阶段卡片|训练计划)/i.test(promptText)) {
     return false
@@ -1157,6 +1242,7 @@ export async function runTask(options: {
 }): Promise<TaskResult> {
   const sourceImagePath = path.resolve(options.imagePath)
   const renderPreference = extractRenderPreference(options.promptText)
+  const infographicInput = isInfographicInput(options.promptText)
 
   if (!(await fileExists(sourceImagePath))) {
     throw new Error(`输入图片不存在: ${sourceImagePath}`)
@@ -1178,6 +1264,7 @@ export async function runTask(options: {
     kimiConfig.enabled && process.env.KIMI_API_KEY && process.env.KIMI_API_KEY.trim()
       ? new KimiCodingClient()
       : undefined
+  const kimiTimeoutMs = options.comparisonGroupId?.startsWith('regression:') ? 15000 : undefined
   const qwenOcr = new QwenOcrClient()
   const qwenVl = new QwenVlClient()
   const renderer = new StageRenderer()
@@ -1316,7 +1403,7 @@ export async function runTask(options: {
       await syncTrace('running')
     }
 
-    const isChartInput = isChartLikeInput(options.promptText, ocrWords)
+    const isChartInput = !infographicInput && isChartLikeInput(options.promptText, ocrWords)
     const scenePrompt = createScenePrompt(
       toPublicRelative(sourceCopyPath),
       width,
@@ -1333,7 +1420,11 @@ export async function runTask(options: {
       promptText: options.promptText,
     })
 
-    if (heuristicInfographicScene && isUsableScene(heuristicInfographicScene, renderPreference, options.promptText)) {
+    if (
+      heuristicInfographicScene &&
+      (infographicInput ||
+        isUsableScene(heuristicInfographicScene, renderPreference, options.promptText))
+    ) {
       scene = heuristicInfographicScene
       sceneResponseSummary = heuristicInfographicScene.summary ?? 'ocr-infographic-fallback'
       await appendTrackedEvent({
@@ -1346,7 +1437,7 @@ export async function runTask(options: {
       await syncTrace('running')
     }
 
-    if (isChartInput) {
+    if (isChartInput && !scene) {
       let chartSpecTraceId: string | undefined
       try {
         chartSpecTraceId = traceRecorder.start('chart-spec', 'chart-spec')
@@ -1428,34 +1519,40 @@ export async function runTask(options: {
             ).text,
           ),
       },
-      {
-        provider: 'codex',
-        label: 'scene-1',
-        run: () =>
-          codex.runStructured<{
-            summary: string
-            scene_json: string
-          }>({
-            label: 'scene-1',
-            prompt: scenePrompt,
-            schema: sceneResponseSchema,
-            imagePaths: [modelImagePath],
-          }),
-      },
-      {
-        provider: 'codex',
-        label: 'scene-2',
-        run: () =>
-          codex.runStructured<{
-            summary: string
-            scene_json: string
-          }>({
-            label: 'scene-2',
-            prompt: scenePrompt,
-            schema: sceneResponseSchema,
-            imagePaths: [modelImagePath],
-          }),
-      },
+      ...(
+        codexQuotaMode
+          ? []
+          : [
+              {
+                provider: 'codex' as const,
+                label: 'scene-1',
+                run: () =>
+                  codex.runStructured<{
+                    summary: string
+                    scene_json: string
+                  }>({
+                    label: 'scene-1',
+                    prompt: scenePrompt,
+                    schema: sceneResponseSchema,
+                    imagePaths: [modelImagePath],
+                  }),
+              },
+              {
+                provider: 'codex' as const,
+                label: 'scene-2',
+                run: () =>
+                  codex.runStructured<{
+                    summary: string
+                    scene_json: string
+                  }>({
+                    label: 'scene-2',
+                    prompt: scenePrompt,
+                    schema: sceneResponseSchema,
+                    imagePaths: [modelImagePath],
+                  }),
+              },
+            ]
+      ),
     ]
 
     for (const candidate of sceneCandidates) {
@@ -1524,6 +1621,7 @@ export async function runTask(options: {
         })
         await syncTrace('running')
       } catch (error) {
+        const quotaModeChanged = recordCodexQuotaMode(error)
         if (sceneTraceId) {
           traceRecorder.finish(sceneTraceId, 'failed', {
             error: error instanceof Error ? error.message : String(error),
@@ -1536,11 +1634,19 @@ export async function runTask(options: {
           label: candidate.label,
           error: error instanceof Error ? error.message : String(error),
         })
+        if (quotaModeChanged) {
+          await appendTrackedEvent({
+            type: 'provider_state_changed',
+            taskId,
+            provider: 'codex',
+            label: 'quota-mode-enabled',
+          })
+        }
         await syncTrace('running')
       }
     }
 
-    if (!scene) {
+    if (!scene && infographicInput) {
       const infographicScene = buildInfographicSceneFromOcr({
         imagePath: toPublicRelative(sourceCopyPath),
         width,
@@ -1583,6 +1689,89 @@ export async function runTask(options: {
     await syncTrace('running')
 
     let workingComponent = buildFallbackComponent(scene)
+    const initialPrompt = createInitialComponentPrompt(scene)
+    let initialComponentTraceId: string | undefined
+    try {
+      if (codexQuotaMode) {
+        throw new Error('Codex quota mode enabled')
+      }
+      initialComponentTraceId = traceRecorder.start('initial-component', 'repair')
+      const initial = await codex.runStructured<ComponentResponse>({
+        label: 'initial-component',
+        prompt: initialPrompt,
+        schema: componentResponseSchema,
+      })
+      workingComponent = ensureRenderableSfc(initial.component, scene)
+      traceRecorder.finish(initialComponentTraceId, 'completed', {
+        details: {
+          provider: 'codex',
+        },
+      })
+      await appendTrackedEvent({
+        type: 'initial_component_completed',
+        taskId,
+        provider: 'codex',
+      })
+      await syncTrace('running')
+    } catch (error) {
+      if (initialComponentTraceId) {
+        traceRecorder.finish(initialComponentTraceId, 'failed', {
+          error: error instanceof Error ? error.message : String(error),
+        })
+      }
+      await appendTrackedEvent({
+        type: 'initial_component_failed',
+        taskId,
+        provider: 'codex',
+        error: error instanceof Error ? error.message : String(error),
+      })
+      if (recordCodexQuotaMode(error)) {
+        await appendTrackedEvent({
+          type: 'provider_state_changed',
+          taskId,
+          provider: 'codex',
+          label: 'quota-mode-enabled',
+        })
+      }
+
+      if (kimi) {
+        let kimiInitialTraceId: string | undefined
+        try {
+          kimiInitialTraceId = traceRecorder.start('initial-component-kimi', 'repair')
+          const kimiInitial = await kimi.complete({
+            systemPrompt:
+              '你是一个严格的 Vue 3 组件生成器。你只能返回完整 Vue SFC，不要解释，不要 markdown。',
+            prompt: `${initialPrompt}\n\n只输出完整 Vue SFC。`,
+            timeoutMs: kimiTimeoutMs,
+          })
+          workingComponent = ensureRenderableSfc(kimiInitial.text, scene)
+          traceRecorder.finish(kimiInitialTraceId, 'completed', {
+            details: {
+              provider: 'kimi',
+            },
+          })
+          await appendTrackedEvent({
+            type: 'initial_component_completed',
+            taskId,
+            provider: 'kimi',
+          })
+          await syncTrace('running')
+        } catch (kimiError) {
+          if (kimiInitialTraceId) {
+            traceRecorder.finish(kimiInitialTraceId, 'failed', {
+              error: kimiError instanceof Error ? kimiError.message : String(kimiError),
+            })
+          }
+          await appendTrackedEvent({
+            type: 'initial_component_failed',
+            taskId,
+            provider: 'kimi',
+            error: kimiError instanceof Error ? kimiError.message : String(kimiError),
+          })
+          await syncTrace('running')
+        }
+      }
+    }
     let nextStageName = 'draft'
 
     for (let iteration = 1; iteration <= pipelineDefaults.maxIterations; iteration += 1) {
@@ -1775,25 +1964,43 @@ export async function runTask(options: {
       }
 
       let repairTraceId: string | undefined
+      let kimiAttemptedFromNoOp = false
+      const allowKimiRepairFallback = Boolean(
+        kimi && shouldUseKimiRepairFallback(scene, stage, renderPreference, infographicInput),
+      )
       try {
+        if (codexQuotaMode) {
+          throw new Error('Codex quota mode enabled')
+        }
         repairTraceId = traceRecorder.start(`repair-${iteration}`, 'repair', {
           stageIndex: iteration,
         })
         const baseStage = bestStage && bestStage.score > stage.score ? bestStage : stage
+        const repairPrompt = shouldUseCompactRepair(scene, stage, renderPreference)
+          ? createCompactRepairPrompt(
+              scene,
+              baseStage,
+              stage.repairReport,
+              renderPreference,
+              ocrHint,
+              bestStage,
+            )
+          : createRepairPrompt(
+              scene,
+              baseStage,
+              stage.repairReport,
+              renderPreference,
+              ocrHint,
+              bestStage,
+            )
         const repair = await codex.runStructured<ComponentResponse>({
           label: `repair-${iteration}`,
-          prompt: createRepairPrompt(
-            scene,
-            baseStage,
-            stage.repairReport,
-            renderPreference,
-            ocrHint,
-            bestStage,
-          ),
+          prompt: repairPrompt,
           schema: componentResponseSchema,
         })
         const repairedComponent = ensureRenderableSfc(repair.component, scene)
-        if (repairedComponent.trim() === workingComponent.trim() && kimi) {
+        if (repairedComponent.trim() === workingComponent.trim() && allowKimiRepairFallback && kimi) {
+          kimiAttemptedFromNoOp = true
           await appendTrackedEvent({
             type: 'repair_noop_detected',
             taskId,
@@ -1804,14 +2011,8 @@ export async function runTask(options: {
           const kimiRepair = await kimi.complete({
             systemPrompt:
               '你是一个严格的 Vue 组件修复器。你只能返回完整 Vue SFC，不要解释，不要 markdown。',
-            prompt: `${createRepairPrompt(
-              scene,
-              baseStage,
-              stage.repairReport,
-              renderPreference,
-              ocrHint,
-              bestStage,
-            )}\n\n只输出完整 Vue SFC。`,
+            prompt: `${repairPrompt}\n\n只输出完整 Vue SFC。`,
+            timeoutMs: kimiTimeoutMs,
           })
           workingComponent = ensureRenderableSfc(kimiRepair.text, scene)
           nextStageName = `kimi-repair-${iteration + 1}`
@@ -1831,6 +2032,7 @@ export async function runTask(options: {
         }
         await syncTrace('running')
       } catch (error) {
+        const forceKimiOnCodexFailure = Boolean(kimi && recordCodexQuotaMode(error))
         if (repairTraceId) {
           traceRecorder.finish(repairTraceId, 'failed', {
             error: error instanceof Error ? error.message : String(error),
@@ -1842,23 +2044,57 @@ export async function runTask(options: {
           stageIndex: iteration,
           error: error instanceof Error ? error.message : String(error),
         })
-        if (kimi) {
-          try {
-            const kimiRepair = await kimi.complete({
-              systemPrompt:
-                '你是一个严格的 Vue 组件修复器。你只能返回完整 Vue SFC，不要解释，不要 markdown。',
-              prompt: `${createRepairPrompt(
+        if (forceKimiOnCodexFailure) {
+          await appendTrackedEvent({
+            type: 'provider_state_changed',
+            taskId,
+            provider: 'codex',
+            label: 'quota-mode-enabled',
+          })
+        }
+        if ((allowKimiRepairFallback || forceKimiOnCodexFailure) && kimi && !kimiAttemptedFromNoOp) {
+          const fallbackBaseStage = bestStage ?? latestStage ?? stage
+          const fallbackPrompt = shouldUseCompactRepair(scene, stage, renderPreference)
+            ? createCompactRepairPrompt(
                 scene,
-                bestStage ?? latestStage ?? stage,
+                fallbackBaseStage,
                 stage.repairReport,
                 renderPreference,
                 ocrHint,
                 bestStage,
-              )}\n\n只输出完整 Vue SFC。`,
+              )
+            : createRepairPrompt(
+                scene,
+                fallbackBaseStage,
+                stage.repairReport,
+                renderPreference,
+                ocrHint,
+                bestStage,
+              )
+          let kimiFallbackTraceId: string | undefined
+          try {
+            kimiFallbackTraceId = traceRecorder.start(`repair-kimi-${iteration}`, 'repair', {
+              stageIndex: iteration,
+            })
+            const kimiRepair = await kimi.complete({
+              systemPrompt:
+                '你是一个严格的 Vue 组件修复器。你只能返回完整 Vue SFC，不要解释，不要 markdown。',
+              prompt: `${fallbackPrompt}\n\n只输出完整 Vue SFC。`,
+              timeoutMs: kimiTimeoutMs,
             })
             workingComponent = ensureRenderableSfc(kimiRepair.text, scene)
             nextStageName = `kimi-fallback-${iteration + 1}`
-          } catch {
+            traceRecorder.finish(kimiFallbackTraceId, 'completed', {
+              details: {
+                provider: 'kimi',
+              },
+            })
+          } catch (kimiError) {
+            if (kimiFallbackTraceId) {
+              traceRecorder.finish(kimiFallbackTraceId, 'failed', {
+                error: kimiError instanceof Error ? kimiError.message : String(kimiError),
+              })
+            }
             workingComponent = buildFallbackComponent(scene)
             nextStageName = `fallback-${iteration + 1}`
           }

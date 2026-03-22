@@ -31,6 +31,13 @@
       "type": "donut"
     },
     {
+      "id": "donut-side-legend",
+      "label": "F2 Donut Side Legend",
+      "imagePath": "test-inputs/截屏2026-03-22 20.26.15.png",
+      "prompt": "/svg/ F2 环形图 donut chart side legend",
+      "type": "donut"
+    },
+    {
       "id": "radar",
       "label": "F2 Radar",
       "imagePath": "test-inputs/截屏2026-03-22 00.56.15.png",

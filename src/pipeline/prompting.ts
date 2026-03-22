@@ -262,3 +262,180 @@ ${bestStage.componentSource}`
 }
   `.trim()
 }
+
+function compactSceneForRepair(scene: SceneDocument, report: RepairReport) {
+  const targetIds = new Set(
+    report.issues
+      .map((issue) => issue.nodeId)
+      .filter((value): value is string => typeof value === 'string'),
+  )
+
+  for (const node of scene.nodes) {
+    if (!targetIds.has(node.id)) {
+      continue
+    }
+
+    if (node.parentId) {
+      targetIds.add(node.parentId)
+    }
+  }
+
+  if (!targetIds.size) {
+    for (const node of scene.nodes) {
+      if (node.render === 'canvas' || node.render === 'svg' || node.type === 'text') {
+        targetIds.add(node.id)
+      }
+    }
+  }
+
+  return scene.nodes
+    .filter((node) => targetIds.has(node.id))
+    .slice(0, 12)
+    .map((node) => ({
+      id: node.id,
+      type: node.type,
+      render: node.render,
+      parentId: node.parentId,
+      frame: node.frame,
+      zIndex: node.zIndex,
+      text: node.text
+        ? {
+            content: node.text.content,
+            fontSize: node.text.fontSize,
+            color: node.text.color,
+            direction: node.text.direction ?? 'horizontal',
+          }
+        : undefined,
+      canvas: node.canvas
+        ? {
+            kind: node.canvas.kind,
+            categories: node.canvas.categories,
+            legendItems: node.canvas.legendItems,
+            series: node.canvas.series.map((series) => ({
+              name: series.name,
+              color: series.color,
+              fillColor: series.fillColor,
+              data: series.data,
+              points: series.points,
+              lineDash: series.lineDash,
+            })),
+            overlays: node.canvas.overlays,
+          }
+        : undefined,
+      svg: typeof node.svg === 'string' ? `inline-svg:${node.svg.slice(0, 160)}` : node.svg,
+      notes: node.notes,
+    }))
+}
+
+function compactIssues(report: RepairReport) {
+  return report.issues.slice(0, 8).map((issue) => ({
+    issueId: issue.issueId,
+    nodeId: issue.nodeId,
+    type: issue.type,
+    severity: issue.severity,
+    description: issue.description,
+    repair: issue.repair,
+  }))
+}
+
+function compactComponentSource(source: string) {
+  if (source.length <= 10000) {
+    return {
+      mode: 'full',
+      value: source,
+    } as const
+  }
+
+  return {
+    mode: 'excerpt',
+    value: `${source.slice(0, 2200)}\n\n/* component truncated */\n\n${source.slice(-800)}`,
+  } as const
+}
+
+export function createCompactRepairPrompt(
+  scene: SceneDocument,
+  stage: StageArtifact,
+  report: RepairReport,
+  renderPreference: RenderPreference,
+  ocrHint?: string,
+  bestStage?: StageArtifact,
+) {
+  const sceneSlice = compactSceneForRepair(scene, report)
+  const issueSlice = compactIssues(report)
+  const compactComponent = compactComponentSource(stage.componentSource)
+  const bestStageHint = bestStage
+    ? {
+        index: bestStage.index,
+        score: Number(bestStage.score.toFixed(4)),
+        renderMode: bestStage.renderMode,
+        metrics: {
+          visualSimilarity: bestStage.metrics.visualSimilarity,
+          focusedVisualSimilarity: bestStage.metrics.focusedVisualSimilarity,
+          structuralSimilarity: bestStage.metrics.structuralSimilarity,
+          colorSimilarity: bestStage.metrics.colorSimilarity,
+          chartShapeSimilarity: bestStage.metrics.chartShapeSimilarity,
+        },
+      }
+    : undefined
+
+  return `
+你是一个严格的 Vue 3 组件定向修复器。只修当前问题，不要整页重写。
+
+${projectMemoryInstructions()}
+
+修复策略：
+- 优先处理 chart_shape_mismatch、color_mismatch、occluded、text_overflow。
+- 只改问题节点及其必要父节点；保持所有 data-node-id 稳定。
+- 当前渲染偏好：${renderPreference}。
+- 如果是折线图、面积图、雷达图或 canvas 图表，优先修几何走势、颜色和图例，不要改动无关布局。
+- 如果是 canvas 节点，可以只修 <canvas> 绘制逻辑或 canvasSpec 对应实现。
+
+目标节点摘要：
+${JSON.stringify(sceneSlice, null, 2)}
+
+当前阶段指标：
+${JSON.stringify(
+    {
+      visualSimilarity: stage.metrics.visualSimilarity,
+      focusedVisualSimilarity: stage.metrics.focusedVisualSimilarity,
+      structuralSimilarity: stage.metrics.structuralSimilarity,
+      colorSimilarity: stage.metrics.colorSimilarity,
+      chartShapeSimilarity: stage.metrics.chartShapeSimilarity,
+      overflowCount: stage.metrics.overflowCount,
+      occlusionCount: stage.metrics.occlusionCount,
+      criticalIssueCount: stage.metrics.criticalIssueCount,
+    },
+    null,
+    2,
+  )}
+
+本轮问题：
+${JSON.stringify(issueSlice, null, 2)}
+
+${
+  ocrHint
+    ? `OCR 提示（截断高置信）：
+${ocrHint.slice(0, 1200)}`
+    : '本轮没有可用 OCR 提示。'
+}
+
+${
+  bestStageHint
+    ? `历史最佳阶段摘要：
+${JSON.stringify(bestStageHint, null, 2)}`
+    : '当前还没有历史最佳阶段摘要。'
+}
+
+${
+  compactComponent.mode === 'full'
+    ? `当前组件：
+${compactComponent.value}`
+    : `当前组件过长，本轮只提供摘要片段。你可以基于目标节点摘要和问题列表重新生成完整 SFC，但必须保留已有 data-node-id。
+
+当前组件摘要片段：
+${compactComponent.value}`
+}
+
+只输出完整 Vue SFC，不要解释，不要 markdown。
+  `.trim()
+}

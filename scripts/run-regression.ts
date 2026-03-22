@@ -45,14 +45,14 @@ const versions: RegressionVersion[] = [
   },
   {
     key: 'dom-svg-v5',
-    label: 'dom-svg-v5',
+    label: 'dom-svg-v6',
     versionTag: 'working-tree',
     branchKind: 'dom-svg',
     mode: 'current',
   },
   {
     key: 'canvas-v2',
-    label: 'canvas-v2',
+    label: 'canvas-v3',
     versionTag: 'working-tree',
     branchKind: 'canvas',
     mode: 'current',
@@ -79,6 +79,7 @@ async function loadDataset(datasetPath: string) {
 
 function parseSelectedCaseIds() {
   const selected = new Set<string>()
+  const selectedVersions = new Set<string>()
   let datasetPath = path.resolve('evals/datasets/core-regression.json')
   for (let index = 2; index < process.argv.length; index += 1) {
     const token = process.argv[index]
@@ -97,9 +98,18 @@ function parseSelectedCaseIds() {
         index += 1
       }
     }
+
+    if (token === '--version') {
+      const versionKey = process.argv[index + 1]
+      if (versionKey) {
+        selectedVersions.add(versionKey)
+        index += 1
+      }
+    }
   }
   return {
     selected,
+    selectedVersions,
     datasetPath,
   }
 }
@@ -115,15 +125,20 @@ async function ensureFixtureInputs() {
   }
 }
 
-async function clearExistingRegressionEntries(activeCases: RegressionCase[]) {
+async function clearExistingRegressionEntries(activeCases: RegressionCase[], activeVersions: RegressionVersion[]) {
   const timeline = await readJson<TimelineDocument>(paths.timelinePath).catch(() => ({
     version: '1.0',
     tasks: [] as TaskTimelineSummary[],
   }))
 
   const managedGroups = new Set(activeCases.map((entry) => `regression:${entry.id}`))
+  const activeVersionLabels = new Set(activeVersions.map((entry) => entry.label))
   timeline.tasks = timeline.tasks.filter(
-    (task) => !task.comparisonGroupId || !managedGroups.has(task.comparisonGroupId),
+    (task) =>
+      !task.comparisonGroupId ||
+      !managedGroups.has(task.comparisonGroupId) ||
+      !task.versionLabel ||
+      !activeVersionLabels.has(task.versionLabel),
   )
   await writeJson(paths.timelinePath, timeline)
 }
@@ -244,14 +259,18 @@ async function runBaselineVersion(version: RegressionVersion, testCase: Regressi
 }
 
 async function main() {
-  const { selected, datasetPath } = parseSelectedCaseIds()
+  const { selected, selectedVersions, datasetPath } = parseSelectedCaseIds()
   const dataset = await loadDataset(datasetPath)
   const activeCases =
     selected.size > 0 ? dataset.cases.filter((entry) => selected.has(entry.id)) : dataset.cases
+  const activeVersions =
+    selectedVersions.size > 0
+      ? versions.filter((entry) => selectedVersions.has(entry.key) || selectedVersions.has(entry.label))
+      : versions
 
   await ensureArtifactsLayout()
   await ensureFixtureInputs()
-  await clearExistingRegressionEntries(activeCases)
+  await clearExistingRegressionEntries(activeCases, activeVersions)
   const failures: Array<{ caseId: string; version: string; error: string }> = []
 
   for (const testCase of activeCases) {
@@ -259,7 +278,7 @@ async function main() {
       throw new Error(`回归图片不存在: ${testCase.imagePath}`)
     }
 
-    for (const version of versions) {
+    for (const version of activeVersions) {
       try {
         if (version.mode === 'current') {
           await runCurrentVersion(version, testCase)
@@ -281,6 +300,7 @@ async function main() {
       {
         cases: activeCases.map((entry) => entry.id),
         versions: versions.map((entry) => entry.label),
+        activeVersions: activeVersions.map((entry) => entry.label),
         failures,
       },
       null,
@@ -298,7 +318,7 @@ async function main() {
     encoding: 'utf8',
   })
   const runId = `eval-${new Date().toISOString().replace(/[:.]/g, '-')}`
-  const versionResults: EvaluationVersionResult[] = versions.map((version) => ({
+  const versionResults: EvaluationVersionResult[] = activeVersions.map((version) => ({
     versionLabel: version.label,
     versionTag: version.versionTag,
     branchKind: version.branchKind,

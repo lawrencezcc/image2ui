@@ -6,6 +6,7 @@ export interface KimiCodingRequest {
   prompt: string
   systemPrompt?: string
   model?: string
+  timeoutMs?: number
 }
 
 interface AnthropicTextContent {
@@ -95,7 +96,8 @@ export class KimiCodingClient {
 
   private async completeWithAnthropic(request: KimiCodingRequest) {
     const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs)
+    const requestTimeoutMs = request.timeoutMs ?? this.timeoutMs
+    const timer = setTimeout(() => controller.abort(), requestTimeoutMs)
 
     try {
       const response = await fetch(`${this.baseURL}/v1/messages`, {
@@ -167,23 +169,28 @@ export class KimiCodingClient {
       throw new Error('Kimi OpenAI 客户端未初始化。')
     }
 
-    const completion = await this.openAiClient.chat.completions.create({
-      model: request.model ?? this.defaultModel,
-      messages: [
-        ...(request.systemPrompt
-          ? [
-              {
-                role: 'system' as const,
-                content: request.systemPrompt,
-              },
-            ]
-          : []),
-        {
-          role: 'user',
-          content: request.prompt,
-        },
-      ],
-    })
+    const completion = await this.openAiClient.chat.completions.create(
+      {
+        model: request.model ?? this.defaultModel,
+        messages: [
+          ...(request.systemPrompt
+            ? [
+                {
+                  role: 'system' as const,
+                  content: request.systemPrompt,
+                },
+              ]
+            : []),
+          {
+            role: 'user',
+            content: request.prompt,
+          },
+        ],
+      },
+      {
+        timeout: request.timeoutMs ?? this.timeoutMs,
+      },
+    )
 
     const text = normalizeTextContent(completion.choices[0]?.message?.content)
     if (!text) {

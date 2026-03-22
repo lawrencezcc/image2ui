@@ -79,7 +79,7 @@ export const kimiConfig = {
   apiKeyEnv: 'KIMI_API_KEY',
   baseURL: process.env.KIMI_BASE_URL ?? 'https://api.kimi.com/coding',
   model: process.env.KIMI_MODEL ?? 'kimi-for-coding',
-  timeoutMs: Number(process.env.KIMI_TIMEOUT_MS ?? '120000'),
+  timeoutMs: Number(process.env.KIMI_TIMEOUT_MS ?? '60000'),
   protocol: process.env.KIMI_PROTOCOL ?? 'anthropic',
   anthropicVersion: process.env.KIMI_ANTHROPIC_VERSION ?? '2023-06-01',
   maxOutputTokens: Number(process.env.KIMI_MAX_OUTPUT_TOKENS ?? '8192'),
