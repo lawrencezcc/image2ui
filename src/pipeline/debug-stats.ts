@@ -57,7 +57,7 @@ function outcomeScore(intent: RepairIntent, current: StageArtifact) {
 }
 
 export function computeDebugStats(previous: StageArtifact | undefined, current: StageArtifact): StageDebugStats | undefined {
-  if (!previous || previous.repairReport.intents.length === 0) {
+  if (!previous) {
     return undefined
   }
 
@@ -92,10 +92,38 @@ export function computeDebugStats(previous: StageArtifact | undefined, current: 
     const previousNode = previousNodes.get(node.nodeId)
     return !previousNode || hashJson(node) !== hashJson(previousNode)
   })
+  const componentChanged = previous.componentSource.trim() !== current.componentSource.trim()
+  const renderChanged =
+    previous.render.renderHash !== current.render.renderHash ||
+    previous.render.layoutHash !== current.render.layoutHash
+  const visualGain = current.metrics.visualSimilarity - previous.metrics.visualSimilarity
+  const focusedVisualGain =
+    current.metrics.focusedVisualSimilarity - previous.metrics.focusedVisualSimilarity
   const overEditCount = changedNodes.filter((node) => !targetedNodes.has(node.nodeId)).length
 
   const previousIssueIds = new Set(previous.repairReport.issues.map((issue) => issue.issueId))
   const newIssueCount = current.repairReport.issues.filter((issue) => !previousIssueIds.has(issue.issueId)).length
+  const noOp = !componentChanged && !renderChanged && changedNodes.length === 0
+
+  if (intents.length === 0) {
+    return {
+      overallAdherenceRate: noOp ? 0 : 1,
+      addExecutionRate: 0,
+      addEffectiveRate: 0,
+      modifyExecutionRate: 0,
+      modifyEffectiveRate: 0,
+      overEditCount,
+      regressionCount: current.metrics.criticalIssueCount > previous.metrics.criticalIssueCount ? 1 : 0,
+      newIssueCount,
+      repairIntentCount: 0,
+      changedNodeCount: changedNodes.length,
+      componentChanged,
+      renderChanged,
+      visualGain,
+      focusedVisualGain,
+      noOp,
+    }
+  }
 
   return {
     overallAdherenceRate:
@@ -115,5 +143,12 @@ export function computeDebugStats(previous: StageArtifact | undefined, current: 
     overEditCount,
     regressionCount: current.metrics.criticalIssueCount > previous.metrics.criticalIssueCount ? 1 : 0,
     newIssueCount,
+    repairIntentCount: intents.length,
+    changedNodeCount: changedNodes.length,
+    componentChanged,
+    renderChanged,
+    visualGain,
+    focusedVisualGain,
+    noOp,
   }
 }

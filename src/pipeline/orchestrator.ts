@@ -5,11 +5,13 @@ import { jsonrepair } from 'jsonrepair'
 import sharp from 'sharp'
 
 import { analyzeStage } from './analyze'
+import { materializeSceneAssets } from './assets'
 import { buildSceneFromChartSpec } from './chart-scene'
-import { pipelineDefaults } from './config'
+import { kimiConfig, paths, pipelineDefaults } from './config'
 import { CodexCliClient } from './codex-client'
 import { computeDebugStats } from './debug-stats'
 import { buildFallbackComponent, isRenderableSfc } from './fallback'
+import { KimiCodingClient } from './kimi-client'
 import { createChartSpecPrompt, createRepairPrompt, createScenePrompt } from './prompting'
 import { QwenOcrClient } from './qwen-ocr-client'
 import { QwenVlClient } from './qwen-vl-client'
@@ -22,6 +24,7 @@ import {
   prepareTaskDirectories,
   toPublicRelative,
   updateTimeline,
+  writeTrace,
 } from './store'
 import type {
   ComponentResponse,
@@ -36,7 +39,9 @@ import type {
   TaskResult,
   TaskSummaryStage,
   TaskTimelineSummary,
+  TaskTraceSummary,
 } from './types'
+import { TraceRecorder } from './trace'
 import {
   createTaskId,
   ensureDir,
@@ -110,6 +115,8 @@ function normalizeNode(rawNode: Record<string, unknown>, index: number): SceneNo
     render:
       rawType === 'canvas'
         ? 'canvas'
+        : rawType === 'image'
+          ? 'html'
         : rawType === 'svg' || rawType.includes('chart') || rawType === 'path' || rawType === 'ellipse'
         ? 'svg'
         : 'html',
@@ -170,6 +177,29 @@ function normalizeNode(rawNode: Record<string, unknown>, index: number): SceneNo
     canvas:
       rawNode.canvas && typeof rawNode.canvas === 'object'
         ? (rawNode.canvas as SceneNode['canvas'])
+        : undefined,
+    asset:
+      rawType === 'image'
+        ? {
+            source:
+              rawNode.asset && typeof rawNode.asset === 'object' && (rawNode.asset as Record<string, unknown>).source === 'generated'
+                ? 'generated'
+                : 'crop',
+            src:
+              rawNode.asset && typeof rawNode.asset === 'object' && typeof (rawNode.asset as Record<string, unknown>).src === 'string'
+                ? String((rawNode.asset as Record<string, unknown>).src)
+                : undefined,
+            cacheKey:
+              rawNode.asset && typeof rawNode.asset === 'object' && typeof (rawNode.asset as Record<string, unknown>).cacheKey === 'string'
+                ? String((rawNode.asset as Record<string, unknown>).cacheKey)
+                : undefined,
+            prompt:
+              rawNode.asset && typeof rawNode.asset === 'object' && typeof (rawNode.asset as Record<string, unknown>).prompt === 'string'
+                ? String((rawNode.asset as Record<string, unknown>).prompt)
+                : typeof rawNode.notes === 'string'
+                  ? rawNode.notes
+                  : undefined,
+          }
         : undefined,
     notes: typeof rawNode.notes === 'string' ? rawNode.notes : undefined,
   }
@@ -885,8 +915,20 @@ function stageDeltaSummary(previous: StageArtifact | undefined, current: StageAr
     return '初稿渲染'
   }
 
-  const issueDelta = previous.repairReport.issues.length - current.repairReport.issues.length
   const similarityDelta = current.metrics.visualSimilarity - previous.metrics.visualSimilarity
+  if (current.debugStats?.noOp) {
+    return `无变化 · 相似度 ${
+      similarityDelta >= 0 ? '+' : ''
+    }${similarityDelta.toFixed(3)}`
+  }
+
+  if (current.debugStats) {
+    return `变更 ${current.debugStats.changedNodeCount} 节点 · 相似度 ${
+      similarityDelta >= 0 ? '+' : ''
+    }${similarityDelta.toFixed(3)}`
+  }
+
+  const issueDelta = previous.repairReport.issues.length - current.repairReport.issues.length
   return `修复 ${Math.max(issueDelta, 0)} 项 · 相似度 ${
     similarityDelta >= 0 ? '+' : ''
   }${similarityDelta.toFixed(3)}`
@@ -913,6 +955,7 @@ function buildTaskSummary(params: {
   versionLabel?: string
   versionTag?: string
   branchKind?: 'dom-svg' | 'canvas' | 'adhoc'
+  trace?: TaskTraceSummary
 }): TaskTimelineSummary {
   const completedStages: TaskSummaryStage[] = params.stages.map((stage, index) => ({
     index: stage.index,
@@ -960,8 +1003,21 @@ function buildTaskSummary(params: {
     versionLabel: params.versionLabel,
     versionTag: params.versionTag,
     branchKind: params.branchKind,
+    trace: params.trace
+      ? {
+          path: toPublicRelative(getTaskTracePath(params.taskId)),
+          spanCount: params.trace.spanCount,
+          eventCount: params.trace.eventCount,
+          totalDurationMs: params.trace.totalDurationMs,
+          latestError: params.trace.latestError,
+        }
+      : undefined,
     stages: completedStages,
   }
+}
+
+function getTaskTracePath(taskId: string) {
+  return path.join(paths.tasksRoot, taskId, 'trace.json')
 }
 
 function buildReasons(metrics: StageMetrics, exitReason: ExitReason) {
@@ -1113,6 +1169,10 @@ export async function runTask(options: {
   const sourceCopyPath = path.join(taskPaths.sourceRoot, `source${extension}`)
   const modelImagePath = path.join(taskPaths.sourceRoot, 'analysis-input.jpg')
   const codex = new CodexCliClient()
+  const kimi =
+    kimiConfig.enabled && process.env.KIMI_API_KEY && process.env.KIMI_API_KEY.trim()
+      ? new KimiCodingClient()
+      : undefined
   const qwenOcr = new QwenOcrClient()
   const qwenVl = new QwenVlClient()
   const renderer = new StageRenderer()
@@ -1124,6 +1184,9 @@ export async function runTask(options: {
   let exitReason: ExitReason = 'max_iterations'
   let bestStage: StageArtifact | undefined
   let latestStage: StageArtifact | undefined
+  let eventCount = 0
+  const traceRecorder = new TraceRecorder(taskId, createdAt)
+  const taskTraceId = traceRecorder.start('task', 'task')
   const summaryMeta = {
     comparisonGroupId: options.comparisonGroupId,
     comparisonGroupLabel: options.comparisonGroupLabel,
@@ -1132,6 +1195,13 @@ export async function runTask(options: {
     versionLabel: options.versionLabel,
     versionTag: options.versionTag,
     branchKind: options.branchKind ?? (renderPreference === 'canvas' ? 'canvas' : 'dom-svg'),
+  }
+  const appendTrackedEvent = async (event: Record<string, unknown>) => {
+    eventCount += 1
+    await appendEvent(taskId, event)
+  }
+  const syncTrace = async (status: 'running' | 'completed') => {
+    await writeTrace(taskId, traceRecorder.snapshot(status, eventCount))
   }
 
   await fs.copyFile(sourceImagePath, sourceCopyPath)
@@ -1164,26 +1234,30 @@ export async function runTask(options: {
       stages,
       status: 'running',
       activeStepLabel: 'scene 解析中',
+      trace: traceRecorder.snapshot('running', eventCount),
       ...summaryMeta,
     }),
   )
-  await appendEvent(taskId, {
+  await appendTrackedEvent({
     type: 'task_started',
     taskId,
     createdAt,
     sourceImagePath,
     renderPreference,
   })
+  await syncTrace('running')
 
   try {
-    await renderer.start()
+      await renderer.start()
 
-    let scene: SceneDocument | undefined
+      let scene: SceneDocument | undefined
     let sceneResponseSummary = ''
     let ocrHint = ''
     let ocrWords: Array<{ text: string; location?: number[] }> = []
 
+    let ocrTraceId: string | undefined
     try {
+      ocrTraceId = traceRecorder.start('ocr', 'ocr')
       await updateTimeline(
         buildTaskSummary({
           taskId,
@@ -1192,6 +1266,7 @@ export async function runTask(options: {
           stages,
           status: 'running',
           activeStepLabel: 'ocr 解析中',
+          trace: traceRecorder.snapshot('running', eventCount),
           ...summaryMeta,
         }),
       )
@@ -1208,19 +1283,32 @@ export async function runTask(options: {
         text: ocrResult.text,
         words: ocrResult.words,
       })
-      await appendEvent(taskId, {
+      traceRecorder.finish(ocrTraceId, 'completed', {
+        details: {
+          wordCount: ocrResult.words.length,
+          requestId: ocrResult.requestId,
+        },
+      })
+      await appendTrackedEvent({
         type: 'ocr_completed',
         taskId,
         textLength: ocrResult.text.length,
         wordCount: ocrResult.words.length,
         requestId: ocrResult.requestId,
       })
+      await syncTrace('running')
     } catch (error) {
-      await appendEvent(taskId, {
+      if (ocrTraceId) {
+        traceRecorder.finish(ocrTraceId, 'failed', {
+          error: error instanceof Error ? error.message : String(error),
+        })
+      }
+      await appendTrackedEvent({
         type: 'ocr_failed',
         taskId,
         error: error instanceof Error ? error.message : String(error),
       })
+      await syncTrace('running')
     }
 
     const isChartInput = isChartLikeInput(options.promptText, ocrWords)
@@ -1234,7 +1322,9 @@ export async function runTask(options: {
     )
 
     if (isChartInput) {
+      let chartSpecTraceId: string | undefined
       try {
+        chartSpecTraceId = traceRecorder.start('chart-spec', 'chart-spec')
         const chartSpecResponse = await qwenVl.complete({
           imagePaths: [modelImagePath],
           prompt: createChartSpecPrompt(width, height, 'auto', ocrHint, options.promptText),
@@ -1253,7 +1343,12 @@ export async function runTask(options: {
         if (chartScene && isUsableScene(chartScene, renderPreference, options.promptText)) {
           scene = chartScene
           sceneResponseSummary = chartScene.summary ?? 'chart-spec'
-          await appendEvent(taskId, {
+          traceRecorder.finish(chartSpecTraceId, 'completed', {
+            details: {
+              nodeCount: chartScene.nodes.length,
+            },
+          })
+          await appendTrackedEvent({
             type: 'scene_selected',
             taskId,
             provider: 'qwen-vl',
@@ -1261,7 +1356,13 @@ export async function runTask(options: {
             nodeCount: chartScene.nodes.length,
           })
         } else {
-          await appendEvent(taskId, {
+          traceRecorder.finish(chartSpecTraceId, 'failed', {
+            error: 'scene-chart-spec 不可用',
+            details: {
+              nodeCount: chartScene?.nodes.length ?? 0,
+            },
+          })
+          await appendTrackedEvent({
             type: 'scene_rejected',
             taskId,
             provider: 'qwen-vl',
@@ -1270,14 +1371,21 @@ export async function runTask(options: {
             renderPreference,
           })
         }
+        await syncTrace('running')
       } catch (error) {
-        await appendEvent(taskId, {
+        if (chartSpecTraceId) {
+          traceRecorder.finish(chartSpecTraceId, 'failed', {
+            error: error instanceof Error ? error.message : String(error),
+          })
+        }
+        await appendTrackedEvent({
           type: 'scene_provider_failed',
           taskId,
           provider: 'qwen-vl',
           label: 'scene-chart-spec',
           error: error instanceof Error ? error.message : String(error),
         })
+        await syncTrace('running')
       }
     }
 
@@ -1330,7 +1438,9 @@ export async function runTask(options: {
         break
       }
 
+      let sceneTraceId: string | undefined
       try {
+        sceneTraceId = traceRecorder.start(candidate.label, 'scene')
         const sceneResponse = await candidate.run()
         const rawScene = parseScenePayload(sceneResponse.scene_json)
         const bridgedScene = await buildSceneFromChartSpec({
@@ -1357,7 +1467,13 @@ export async function runTask(options: {
         if (isUsableScene(fittedScene, renderPreference, options.promptText)) {
           scene = fittedScene
           sceneResponseSummary = sceneResponse.summary
-          await appendEvent(taskId, {
+          traceRecorder.finish(sceneTraceId, 'completed', {
+            details: {
+              nodeCount: fittedScene.nodes.length,
+              provider: candidate.provider,
+            },
+          })
+          await appendTrackedEvent({
             type: 'scene_selected',
             taskId,
             provider: candidate.provider,
@@ -1367,7 +1483,13 @@ export async function runTask(options: {
           break
         }
 
-        await appendEvent(taskId, {
+        traceRecorder.finish(sceneTraceId, 'failed', {
+          error: 'scene 不可用',
+          details: {
+            nodeCount: fittedScene.nodes.length,
+          },
+        })
+        await appendTrackedEvent({
           type: 'scene_rejected',
           taskId,
           provider: candidate.provider,
@@ -1375,14 +1497,21 @@ export async function runTask(options: {
           nodeCount: fittedScene.nodes.length,
           renderPreference,
         })
+        await syncTrace('running')
       } catch (error) {
-        await appendEvent(taskId, {
+        if (sceneTraceId) {
+          traceRecorder.finish(sceneTraceId, 'failed', {
+            error: error instanceof Error ? error.message : String(error),
+          })
+        }
+        await appendTrackedEvent({
           type: 'scene_provider_failed',
           taskId,
           provider: candidate.provider,
           label: candidate.label,
           error: error instanceof Error ? error.message : String(error),
         })
+        await syncTrace('running')
       }
     }
 
@@ -1391,7 +1520,19 @@ export async function runTask(options: {
     }
 
     scene.summary = sceneResponseSummary
+    const assetTraceId = traceRecorder.start('materialize-assets', 'asset')
+    scene = await materializeSceneAssets({
+      scene,
+      sourceImagePath: sourceCopyPath,
+      assetsRoot: taskPaths.assetsRoot,
+    })
+    traceRecorder.finish(assetTraceId, 'completed', {
+      details: {
+        imageNodeCount: scene.nodes.filter((node) => node.type === 'image').length,
+      },
+    })
     await writeJson(path.join(taskPaths.taskRoot, 'scene.json'), scene)
+    await syncTrace('running')
 
     let workingComponent = buildFallbackComponent(scene)
     let nextStageName = 'draft'
@@ -1415,6 +1556,7 @@ export async function runTask(options: {
             name: stageName,
             placeholderMessage: '正在生成组件、渲染截图并执行检测…',
           },
+          trace: traceRecorder.snapshot('running', eventCount),
           ...summaryMeta,
         }),
       )
@@ -1430,6 +1572,9 @@ export async function runTask(options: {
 
       await writeText(componentPath, `${workingComponent}\n`)
 
+      const renderTraceId = traceRecorder.start(stageName, 'render', {
+        stageIndex: iteration,
+      })
       const render = await renderer.renderStage({
         taskId,
         stageId: getStageDirectoryName(iteration, stageName),
@@ -1438,7 +1583,15 @@ export async function runTask(options: {
         screenshotPath,
         domSnapshotPath,
       })
+      traceRecorder.finish(renderTraceId, 'completed', {
+        details: {
+          renderHash: render.renderHash,
+        },
+      })
 
+      const analyzeTraceId = traceRecorder.start(stageName, 'analyze', {
+        stageIndex: iteration,
+      })
       const analysis = await analyzeStage({
         scene,
         referenceImagePath: sourceCopyPath,
@@ -1446,6 +1599,12 @@ export async function runTask(options: {
         diffTargetPath,
         diffPrevPath,
         previousScreenshotPath: latestStage?.screenshotPath,
+      })
+      traceRecorder.finish(analyzeTraceId, 'completed', {
+        details: {
+          visualSimilarity: analysis.metrics.visualSimilarity,
+          criticalIssueCount: analysis.metrics.criticalIssueCount,
+        },
       })
 
       const stage: StageArtifact = {
@@ -1489,7 +1648,7 @@ export async function runTask(options: {
         issueHistory.set(issue.signature, (issueHistory.get(issue.signature) ?? 0) + 1)
       }
 
-      await appendEvent(taskId, {
+      await appendTrackedEvent({
         type: 'stage_completed',
         taskId,
         stageIndex: iteration,
@@ -1497,6 +1656,7 @@ export async function runTask(options: {
         metrics: stage.metrics,
         debug: stage.debugStats,
       })
+      await syncTrace('running')
       await updateTimeline(
         buildTaskSummary({
           taskId,
@@ -1506,6 +1666,7 @@ export async function runTask(options: {
           bestStage,
           status: 'running',
           activeStepLabel: '分析修复建议中',
+          trace: traceRecorder.snapshot('running', eventCount),
           ...summaryMeta,
         }),
       )
@@ -1565,7 +1726,11 @@ export async function runTask(options: {
         break
       }
 
+      let repairTraceId: string | undefined
       try {
+        repairTraceId = traceRecorder.start(`repair-${iteration}`, 'repair', {
+          stageIndex: iteration,
+        })
         const baseStage = bestStage && bestStage.score > stage.score ? bestStage : stage
         const repair = await codex.runStructured<ComponentResponse>({
           label: `repair-${iteration}`,
@@ -1579,21 +1744,88 @@ export async function runTask(options: {
           ),
           schema: componentResponseSchema,
         })
-        workingComponent = ensureRenderableSfc(repair.component, scene)
-        nextStageName = repair.summary || `repair-${iteration + 1}`
+        const repairedComponent = ensureRenderableSfc(repair.component, scene)
+        if (repairedComponent.trim() === workingComponent.trim() && kimi) {
+          await appendTrackedEvent({
+            type: 'repair_noop_detected',
+            taskId,
+            stageIndex: iteration,
+            provider: 'codex',
+          })
+
+          const kimiRepair = await kimi.complete({
+            systemPrompt:
+              '你是一个严格的 Vue 组件修复器。你只能返回完整 Vue SFC，不要解释，不要 markdown。',
+            prompt: `${createRepairPrompt(
+              scene,
+              baseStage,
+              stage.repairReport,
+              renderPreference,
+              ocrHint,
+              bestStage,
+            )}\n\n只输出完整 Vue SFC。`,
+          })
+          workingComponent = ensureRenderableSfc(kimiRepair.text, scene)
+          nextStageName = `kimi-repair-${iteration + 1}`
+          traceRecorder.finish(repairTraceId, 'completed', {
+            details: {
+              provider: 'kimi',
+            },
+          })
+        } else {
+          workingComponent = repairedComponent
+          nextStageName = repair.summary || `repair-${iteration + 1}`
+          traceRecorder.finish(repairTraceId, 'completed', {
+            details: {
+              provider: 'codex',
+            },
+          })
+        }
+        await syncTrace('running')
       } catch (error) {
-        await appendEvent(taskId, {
+        if (repairTraceId) {
+          traceRecorder.finish(repairTraceId, 'failed', {
+            error: error instanceof Error ? error.message : String(error),
+          })
+        }
+        await appendTrackedEvent({
           type: 'repair_failed',
           taskId,
           stageIndex: iteration,
           error: error instanceof Error ? error.message : String(error),
         })
-        workingComponent = buildFallbackComponent(scene)
-        nextStageName = `fallback-${iteration + 1}`
+        if (kimi) {
+          try {
+            const kimiRepair = await kimi.complete({
+              systemPrompt:
+                '你是一个严格的 Vue 组件修复器。你只能返回完整 Vue SFC，不要解释，不要 markdown。',
+              prompt: `${createRepairPrompt(
+                scene,
+                bestStage ?? latestStage ?? stage,
+                stage.repairReport,
+                renderPreference,
+                ocrHint,
+                bestStage,
+              )}\n\n只输出完整 Vue SFC。`,
+            })
+            workingComponent = ensureRenderableSfc(kimiRepair.text, scene)
+            nextStageName = `kimi-fallback-${iteration + 1}`
+          } catch {
+            workingComponent = buildFallbackComponent(scene)
+            nextStageName = `fallback-${iteration + 1}`
+          }
+        } else {
+          workingComponent = buildFallbackComponent(scene)
+          nextStageName = `fallback-${iteration + 1}`
+        }
+        await syncTrace('running')
       }
     }
   } catch (error) {
-    await appendEvent(taskId, {
+    traceRecorder.finish(taskTraceId, 'failed', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+    await appendTrackedEvent({
       type: 'task_failed',
       taskId,
       error: error instanceof Error ? error.message : String(error),
@@ -1608,9 +1840,11 @@ export async function runTask(options: {
           stages,
           status: 'completed',
           exitReason: 'model_error',
+          trace: traceRecorder.snapshot('completed', eventCount),
           ...summaryMeta,
         }),
       )
+      await syncTrace('completed')
       throw error
     }
 
@@ -1623,29 +1857,22 @@ export async function runTask(options: {
     throw new Error('任务未能产生任何阶段输出')
   }
 
-  const summary: TaskTimelineSummary = {
-    ...buildTaskSummary({
-      taskId,
-      createdAt,
-      inputImage: toPublicRelative(sourceCopyPath),
-      stages,
-      bestStage,
-      status: 'completed',
-      exitReason,
-      ...summaryMeta,
-    }),
-  }
-
   const aggregateDebug = {
     taskId,
     summary: {
       totalStages: stages.length,
       bestStage: bestStage.index,
-      overallAdherenceRate:
-        stages
+      overallAdherenceRate: (() => {
+        const values = stages
           .map((stage) => stage.debugStats?.overallAdherenceRate)
           .filter((value): value is number => typeof value === 'number')
-          .reduce((sum, value, _, array) => sum + value / array.length, 0) || 1,
+
+        if (!values.length) {
+          return 0
+        }
+
+        return values.reduce((sum, value) => sum + value, 0) / values.length
+      })(),
     },
     stages: stages
       .filter((stage) => stage.debugStats)
@@ -1667,13 +1894,36 @@ export async function runTask(options: {
     metExpectation: isSuccess(bestStage.metrics),
   })
 
+  traceRecorder.finish(taskTraceId, 'completed', {
+    details: {
+      exitReason,
+      bestStageIndex: bestStage.index,
+    },
+  })
+  const completedTrace = traceRecorder.snapshot('completed', eventCount)
+  const summary: TaskTimelineSummary = {
+    ...buildTaskSummary({
+      taskId,
+      createdAt,
+      inputImage: toPublicRelative(sourceCopyPath),
+      stages,
+      bestStage,
+      status: 'completed',
+      exitReason,
+      trace: completedTrace,
+      ...summaryMeta,
+    }),
+  }
+
   await updateTimeline(summary)
-  await appendEvent(taskId, {
+  await writeTrace(taskId, completedTrace)
+  await appendTrackedEvent({
     type: 'task_finished',
     taskId,
     exitReason,
     bestStageIndex: bestStage.index,
   })
+  await writeTrace(taskId, traceRecorder.snapshot('completed', eventCount))
 
   return {
     taskId,

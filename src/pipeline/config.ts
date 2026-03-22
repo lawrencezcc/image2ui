@@ -19,6 +19,9 @@ export const paths = {
   publicRoot: path.join(projectRoot, 'public'),
   artifactsRoot: path.join(projectRoot, 'public', 'artifacts'),
   tasksRoot: path.join(projectRoot, 'public', 'artifacts', 'tasks'),
+  evalsRoot: path.join(projectRoot, 'public', 'artifacts', 'evals'),
+  evalHistoryPath: path.join(projectRoot, 'public', 'artifacts', 'evals', 'history.json'),
+  generatedAssetsRoot: path.join(projectRoot, 'public', 'artifacts', 'generated-assets'),
   runtimeRoot: path.join(projectRoot, 'public', 'artifacts', 'runtime'),
   runtimeMetaPath: path.join(projectRoot, 'public', 'artifacts', 'runtime', 'current-stage.json'),
   runtimeComponentPath: path.join(projectRoot, 'src', 'runtime', 'generated', 'CurrentStage.vue'),
@@ -70,4 +73,23 @@ export const qwenOcrConfig = {
   timeoutMs: Number(process.env.QWEN_OCR_TIMEOUT_MS ?? '120000'),
   minPixels: Number(process.env.QWEN_OCR_MIN_PIXELS ?? `${32 * 32 * 3}`),
   maxPixels: Number(process.env.QWEN_OCR_MAX_PIXELS ?? `${32 * 32 * 8192}`),
+}
+
+export const kimiConfig = {
+  apiKeyEnv: 'KIMI_API_KEY',
+  baseURL: process.env.KIMI_BASE_URL ?? 'https://api.kimi.com/coding/v1',
+  model: process.env.KIMI_MODEL ?? 'kimi-for-coding',
+  timeoutMs: Number(process.env.KIMI_TIMEOUT_MS ?? '120000'),
+  enabled: process.env.ENABLE_KIMI_FALLBACK === 'true',
+}
+
+export const qwenImageConfig = {
+  apiKeyEnv: 'DASHSCOPE_API_KEY',
+  baseURL:
+    process.env.QWEN_IMAGE_BASE_URL ??
+    'https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation',
+  model: process.env.QWEN_IMAGE_MODEL ?? 'qwen-image-2.0',
+  proModel: process.env.QWEN_IMAGE_PRO_MODEL ?? 'qwen-image-2.0-pro',
+  timeoutMs: Number(process.env.QWEN_IMAGE_TIMEOUT_MS ?? '180000'),
+  allowGeneratedFallback: process.env.ALLOW_GENERATED_ASSET_FALLBACK === 'true',
 }

@@ -49,6 +49,11 @@ type OcrContentItem = {
   }
 }
 
+type EmbeddedOcrItem = {
+  text?: string
+  rotate_rect?: number[]
+}
+
 type OcrApiResponse = {
   request_id?: string
   output?: {
@@ -101,13 +106,66 @@ function normalizeText(content: OcrContentItem[] | undefined) {
 }
 
 function normalizeWords(content: OcrContentItem[] | undefined) {
-  return (content ?? [])
+  const explicitWords = (content ?? [])
     .flatMap((item) => item.ocr_result?.words_info ?? [])
     .map((word) => ({
       text: word.text?.trim() ?? '',
       location: Array.isArray(word.location) ? word.location : undefined,
     }))
     .filter((word) => word.text)
+
+  if (explicitWords.length > 0) {
+    return explicitWords
+  }
+
+  return (content ?? [])
+    .flatMap((item) => parseEmbeddedWords(item.text))
+    .filter((word) => word.text)
+}
+
+function rotateRectToLocation(rotateRect: number[]) {
+  if (!Array.isArray(rotateRect) || rotateRect.length < 4) {
+    return undefined
+  }
+
+  const [x, y, width, height] = rotateRect
+  return [
+    x,
+    y,
+    x + width,
+    y,
+    x + width,
+    y + height,
+    x,
+    y + height,
+  ]
+}
+
+function parseEmbeddedWords(text: string | undefined) {
+  if (!text) {
+    return []
+  }
+
+  const fencedMatch = text.match(/```json\s*([\s\S]*?)```/i)
+  const candidate = fencedMatch?.[1] ?? text
+
+  try {
+    const parsed = JSON.parse(candidate) as EmbeddedOcrItem[]
+    if (!Array.isArray(parsed)) {
+      return []
+    }
+
+    return parsed
+      .map((entry) => ({
+        text: entry.text?.trim() ?? '',
+        location: Array.isArray(entry.rotate_rect)
+          ? rotateRectToLocation(entry.rotate_rect)
+          : undefined,
+      }))
+      .filter((entry) => entry.text)
+  } catch {
+    return []
+  }
 }
 
 export class QwenOcrClient {

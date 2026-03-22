@@ -15,6 +15,9 @@ type StageTimelineItem = {
   metrics?: {
     visualSimilarity: number
     focusedVisualSimilarity?: number
+    structuralSimilarity?: number
+    colorSimilarity?: number
+    chartShapeSimilarity?: number
     overflowCount: number
     occlusionCount: number
     criticalIssueCount: number
@@ -24,6 +27,12 @@ type StageTimelineItem = {
     addExecutionRate: number
     modifyExecutionRate: number
     overEditCount: number
+    repairIntentCount: number
+    changedNodeCount: number
+    componentChanged: boolean
+    renderChanged: boolean
+    visualGain: number
+    noOp: boolean
   }
 }
 
@@ -45,6 +54,13 @@ type TaskTimelineItem = {
   versionLabel?: string
   versionTag?: string
   branchKind?: 'dom-svg' | 'canvas' | 'adhoc'
+  trace?: {
+    path: string
+    spanCount: number
+    eventCount: number
+    totalDurationMs?: number
+    latestError?: string
+  }
   stages: StageTimelineItem[]
 }
 
@@ -199,6 +215,26 @@ function formatRate(value?: number) {
   return `${Math.round(value * 100)}%`
 }
 
+function formatDelta(value?: number) {
+  if (typeof value !== 'number' || Number.isNaN(value)) {
+    return '--'
+  }
+
+  return `${value >= 0 ? '+' : ''}${value.toFixed(3)}`
+}
+
+function formatDuration(value?: number) {
+  if (typeof value !== 'number' || Number.isNaN(value)) {
+    return '--'
+  }
+
+  if (value < 1000) {
+    return `${Math.round(value)}ms`
+  }
+
+  return `${(value / 1000).toFixed(1)}s`
+}
+
 function formatRenderMode(stage: StageTimelineItem) {
   if (!stage.renderMode) {
     return '绘制 auto'
@@ -288,6 +324,10 @@ watch(tasks, () => {
                   {{ task.status === 'running' ? `进行中：${task.activeStepLabel ?? '处理中'}` : `退出：${task.exitReason}` }}
                 </p>
                 <p class="task-best">最佳阶段：{{ task.bestStageIndex || '--' }}</p>
+                <p v-if="task.trace" class="task-best">
+                  Trace：{{ task.trace.spanCount }} spans · {{ task.trace.eventCount }} events ·
+                  {{ formatDuration(task.trace.totalDurationMs) }}
+                </p>
               </aside>
 
               <span class="task-toggle-indicator">
@@ -337,11 +377,21 @@ watch(tasks, () => {
                       相似度 {{ formatRate(stage.metrics?.visualSimilarity) }} ·
                       遵从率 {{ formatRate(stage.debug?.overallAdherenceRate) }}
                     </small>
+                    <small>
+                      结构 {{ formatRate(stage.metrics?.structuralSimilarity) }} ·
+                      颜色 {{ formatRate(stage.metrics?.colorSimilarity) }} ·
+                      走势 {{ formatRate(stage.metrics?.chartShapeSimilarity) }}
+                    </small>
                     <small>{{ formatRenderMode(stage) }}</small>
                     <small>
                       溢出 {{ stage.metrics?.overflowCount ?? '--' }} · 遮挡
                       {{ stage.metrics?.occlusionCount ?? '--' }} · 严重问题
                       {{ stage.metrics?.criticalIssueCount ?? '--' }}
+                    </small>
+                    <small>
+                      节点变化 {{ stage.debug?.changedNodeCount ?? '--' }} ·
+                      相似度变化 {{ formatDelta(stage.debug?.visualGain) }} ·
+                      {{ stage.debug?.noOp ? '本轮为 no-op' : '本轮有实际改动' }}
                     </small>
                   </figcaption>
                 </template>

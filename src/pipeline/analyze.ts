@@ -3,6 +3,7 @@ import fs from 'node:fs/promises'
 import pixelmatch from 'pixelmatch'
 import { PNG } from 'pngjs'
 import sharp from 'sharp'
+import { ssim } from 'ssim.js'
 
 import type {
   Constraint,
@@ -14,6 +15,7 @@ import type {
   SceneDocument,
   StageMetrics,
 } from './types'
+import { loadRawImageSampler, traceLineSeries } from './image-sampler'
 import { hashValue, percentile } from './utils'
 
 async function toSizedPngBuffer(imagePath: string, width: number, height: number) {
@@ -161,6 +163,272 @@ function cropPng(
   return cropped
 }
 
+function toGrayscaleData(png: PNG) {
+  const data = new Uint8ClampedArray(png.width * png.height * 4)
+
+  for (let y = 0; y < png.height; y += 1) {
+    for (let x = 0; x < png.width; x += 1) {
+      const sourceIndex = (y * png.width + x) * 4
+      const targetIndex = sourceIndex
+      const value = Math.round(
+        (png.data[sourceIndex] ?? 0) * 0.299 +
+          (png.data[sourceIndex + 1] ?? 0) * 0.587 +
+          (png.data[sourceIndex + 2] ?? 0) * 0.114,
+      )
+
+      data[targetIndex] = value
+      data[targetIndex + 1] = value
+      data[targetIndex + 2] = value
+      data[targetIndex + 3] = 255
+    }
+  }
+
+  return {
+    data,
+    width: png.width,
+    height: png.height,
+  }
+}
+
+function buildForegroundMask(png: PNG, threshold = 18) {
+  const background = sampleBackground(png)
+  const mask = new Uint8Array(png.width * png.height)
+
+  for (let y = 0; y < png.height; y += 1) {
+    for (let x = 0; x < png.width; x += 1) {
+      const index = (y * png.width + x) * 4
+      const alpha = png.data[index + 3] ?? 0
+      if (alpha < 16) {
+        continue
+      }
+
+      const pixel = {
+        r: png.data[index] ?? 0,
+        g: png.data[index + 1] ?? 0,
+        b: png.data[index + 2] ?? 0,
+      }
+
+      if (colorDistance(pixel, background) > threshold) {
+        mask[y * png.width + x] = 1
+      }
+    }
+  }
+
+  return mask
+}
+
+function computeMaskIoU(referenceMask: Uint8Array, candidateMask: Uint8Array) {
+  let intersection = 0
+  let union = 0
+
+  for (let index = 0; index < referenceMask.length; index += 1) {
+    const ref = referenceMask[index] ?? 0
+    const cand = candidateMask[index] ?? 0
+    if (ref || cand) {
+      union += 1
+    }
+    if (ref && cand) {
+      intersection += 1
+    }
+  }
+
+  if (union === 0) {
+    return 1
+  }
+
+  return intersection / union
+}
+
+function buildEdgeMask(png: PNG, threshold = 36) {
+  const edgeMask = new Uint8Array(png.width * png.height)
+
+  for (let y = 1; y < png.height - 1; y += 1) {
+    for (let x = 1; x < png.width - 1; x += 1) {
+      const index = (y * png.width + x) * 4
+      const rightIndex = (y * png.width + (x + 1)) * 4
+      const downIndex = ((y + 1) * png.width + x) * 4
+      const luma = (png.data[index] ?? 0) * 0.299 + (png.data[index + 1] ?? 0) * 0.587 + (png.data[index + 2] ?? 0) * 0.114
+      const rightLuma =
+        (png.data[rightIndex] ?? 0) * 0.299 +
+        (png.data[rightIndex + 1] ?? 0) * 0.587 +
+        (png.data[rightIndex + 2] ?? 0) * 0.114
+      const downLuma =
+        (png.data[downIndex] ?? 0) * 0.299 +
+        (png.data[downIndex + 1] ?? 0) * 0.587 +
+        (png.data[downIndex + 2] ?? 0) * 0.114
+      const gradient = Math.abs(luma - rightLuma) + Math.abs(luma - downLuma)
+
+      if (gradient >= threshold) {
+        edgeMask[y * png.width + x] = 1
+      }
+    }
+  }
+
+  return edgeMask
+}
+
+function computeEdgeSimilarity(referenceMask: Uint8Array, candidateMask: Uint8Array) {
+  let intersection = 0
+  let union = 0
+
+  for (let index = 0; index < referenceMask.length; index += 1) {
+    const ref = referenceMask[index] ?? 0
+    const cand = candidateMask[index] ?? 0
+    if (ref || cand) {
+      union += 1
+    }
+    if (ref && cand) {
+      intersection += 1
+    }
+  }
+
+  if (union === 0) {
+    return 1
+  }
+
+  return intersection / union
+}
+
+function computeColorSimilarity(reference: PNG, candidate: PNG, focusMask: Uint8Array) {
+  let compared = 0
+  let totalDistance = 0
+
+  for (let index = 0; index < focusMask.length; index += 1) {
+    if (!focusMask[index]) {
+      continue
+    }
+
+    const rgbaIndex = index * 4
+    const left = {
+      r: reference.data[rgbaIndex] ?? 0,
+      g: reference.data[rgbaIndex + 1] ?? 0,
+      b: reference.data[rgbaIndex + 2] ?? 0,
+    }
+    const right = {
+      r: candidate.data[rgbaIndex] ?? 0,
+      g: candidate.data[rgbaIndex + 1] ?? 0,
+      b: candidate.data[rgbaIndex + 2] ?? 0,
+    }
+
+    compared += 1
+    totalDistance += colorDistance(left, right)
+  }
+
+  if (!compared) {
+    return 1
+  }
+
+  const averageDistance = totalDistance / compared
+  return Math.max(0, 1 - averageDistance / 255)
+}
+
+function extractTraceAtX(points: Array<{ x: number; y: number }>, targetX: number) {
+  if (!points.length) {
+    return undefined
+  }
+
+  const nearest = points.reduce(
+    (best, point) => {
+      const distance = Math.abs(point.x - targetX)
+      if (!best || distance < best.distance) {
+        return {
+          point,
+          distance,
+        }
+      }
+
+      return best
+    },
+    undefined as { point: { x: number; y: number }; distance: number } | undefined,
+  )
+
+  return nearest?.distance !== undefined && nearest.distance <= 0.08 ? nearest.point.y : undefined
+}
+
+function compareTraceSeries(
+  referencePoints: Array<{ x: number; y: number }>,
+  candidatePoints: Array<{ x: number; y: number }>,
+) {
+  if (referencePoints.length < 8 || candidatePoints.length < 8) {
+    return undefined
+  }
+
+  const samples = 32
+  const referenceSeries: number[] = []
+  const candidateSeries: number[] = []
+
+  for (let index = 0; index < samples; index += 1) {
+    const x = index / Math.max(samples - 1, 1)
+    const left = extractTraceAtX(referencePoints, x)
+    const right = extractTraceAtX(candidatePoints, x)
+    if (typeof left !== 'number' || typeof right !== 'number') {
+      continue
+    }
+
+    referenceSeries.push(left)
+    candidateSeries.push(right)
+  }
+
+  if (referenceSeries.length < 8 || candidateSeries.length < 8) {
+    return undefined
+  }
+
+  let squaredError = 0
+  let trendMatches = 0
+  let trendSamples = 0
+
+  for (let index = 0; index < referenceSeries.length; index += 1) {
+    const delta = Math.abs(referenceSeries[index] - candidateSeries[index])
+    squaredError += delta * delta
+
+    if (index === 0) {
+      continue
+    }
+
+    const leftSlope = referenceSeries[index] - referenceSeries[index - 1]
+    const rightSlope = candidateSeries[index] - candidateSeries[index - 1]
+    trendSamples += 1
+    if (Math.sign(leftSlope) === Math.sign(rightSlope) || Math.abs(leftSlope - rightSlope) < 0.02) {
+      trendMatches += 1
+    }
+  }
+
+  const rmse = Math.sqrt(squaredError / referenceSeries.length)
+  const shapeScore = Math.max(0, 1 - rmse / 0.4)
+  const trendScore = trendSamples > 0 ? trendMatches / trendSamples : 1
+  return shapeScore * 0.7 + trendScore * 0.3
+}
+
+async function computeChartShapeSimilarity(
+  scene: SceneDocument,
+  referenceImagePath: string,
+  candidateImagePath: string,
+) {
+  const chartNode = scene.nodes.find((node) =>
+    Boolean(node.canvas && (node.canvas.kind === 'line' || node.canvas.kind === 'area')),
+  )
+
+  if (!chartNode?.canvas) {
+    return undefined
+  }
+
+  const referenceSampler = await loadRawImageSampler(referenceImagePath)
+  const candidateSampler = await loadRawImageSampler(candidateImagePath)
+  const scores = chartNode.canvas.series
+    .map((series) => {
+      const referenceTrace = traceLineSeries(referenceSampler, chartNode.frame, series.color, 96)
+      const candidateTrace = traceLineSeries(candidateSampler, chartNode.frame, series.color, 96)
+      return compareTraceSeries(referenceTrace, candidateTrace)
+    })
+    .filter((value): value is number => typeof value === 'number')
+
+  if (!scores.length) {
+    return undefined
+  }
+
+  return scores.reduce((sum, value) => sum + value, 0) / scores.length
+}
+
 async function compareImages(referencePath: string, candidatePath: string, diffPath: string) {
   const metadata = await sharp(referencePath).metadata()
   const width = metadata.width ?? 1
@@ -201,8 +469,31 @@ async function compareImages(referencePath: string, candidatePath: string, diffP
   const globalVisualSimilarity = 1 - diffPixels / (width * height)
   const focusedVisualSimilarity =
     1 - focusedDiffPixels / (focusBounds.width * focusBounds.height)
+  const structuralSimilarity = ssim(
+    toGrayscaleData(focusedReference),
+    toGrayscaleData(focusedCandidate),
+  ).mssim
+  const referenceForegroundMask = buildForegroundMask(focusedReference)
+  const candidateForegroundMask = buildForegroundMask(focusedCandidate)
+  const foregroundIoU = computeMaskIoU(referenceForegroundMask, candidateForegroundMask)
+  const edgeSimilarity = computeEdgeSimilarity(
+    buildEdgeMask(focusedReference),
+    buildEdgeMask(focusedCandidate),
+  )
+  const focusMask = new Uint8Array(referenceForegroundMask.length)
+  for (let index = 0; index < focusMask.length; index += 1) {
+    focusMask[index] =
+      (referenceForegroundMask[index] ?? 0) || (candidateForegroundMask[index] ?? 0) ? 1 : 0
+  }
+  const colorSimilarity = computeColorSimilarity(focusedReference, focusedCandidate, focusMask)
   const activeRegionCoverage = (focusBounds.width * focusBounds.height) / (width * height)
-  const visualSimilarity = globalVisualSimilarity * 0.3 + focusedVisualSimilarity * 0.7
+  const visualSimilarity =
+    globalVisualSimilarity * 0.1 +
+    focusedVisualSimilarity * 0.28 +
+    structuralSimilarity * 0.24 +
+    foregroundIoU * 0.16 +
+    edgeSimilarity * 0.1 +
+    colorSimilarity * 0.12
 
   return {
     width,
@@ -212,6 +503,10 @@ async function compareImages(referencePath: string, candidatePath: string, diffP
     visualSimilarity,
     globalVisualSimilarity,
     focusedVisualSimilarity,
+    structuralSimilarity,
+    foregroundIoU,
+    edgeSimilarity,
+    colorSimilarity,
     activeRegionCoverage,
   }
 }
@@ -426,6 +721,12 @@ export async function analyzeStage(options: {
     await compareImages(options.previousScreenshotPath, options.render.screenshotPath, options.diffPrevPath)
   }
 
+  const chartShapeSimilarity = await computeChartShapeSimilarity(
+    options.scene,
+    options.referenceImagePath,
+    options.render.screenshotPath,
+  )
+
   const issues: RepairIssue[] = []
   const bboxErrors: number[] = []
   const snapshots = createSnapshotMap(options.render.nodes)
@@ -559,10 +860,18 @@ export async function analyzeStage(options: {
   issues.push(...constraintIssues)
 
   const metrics: StageMetrics = {
-    visualSimilarity: comparison.visualSimilarity,
+    visualSimilarity:
+      typeof chartShapeSimilarity === 'number'
+        ? comparison.visualSimilarity * 0.72 + chartShapeSimilarity * 0.28
+        : comparison.visualSimilarity,
     pixelDiffRatio: comparison.pixelDiffRatio,
     globalVisualSimilarity: comparison.globalVisualSimilarity,
     focusedVisualSimilarity: comparison.focusedVisualSimilarity,
+    structuralSimilarity: comparison.structuralSimilarity,
+    foregroundIoU: comparison.foregroundIoU,
+    edgeSimilarity: comparison.edgeSimilarity,
+    colorSimilarity: comparison.colorSimilarity,
+    chartShapeSimilarity,
     activeRegionCoverage: comparison.activeRegionCoverage,
     overflowCount: issues.filter((issue) => issue.type === 'text_overflow').length,
     occlusionCount: issues.filter((issue) => issue.type === 'occluded').length,

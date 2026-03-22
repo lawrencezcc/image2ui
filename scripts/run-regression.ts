@@ -4,8 +4,13 @@ import { spawnSync } from 'node:child_process'
 
 import { paths } from '../src/pipeline/config'
 import { runTask } from '../src/pipeline/orchestrator'
-import { ensureArtifactsLayout, updateTimeline } from '../src/pipeline/store'
-import type { TaskTimelineSummary, TimelineDocument } from '../src/pipeline/types'
+import { appendEvaluationRun, ensureArtifactsLayout, updateTimeline } from '../src/pipeline/store'
+import type {
+  EvaluationRun,
+  EvaluationVersionResult,
+  TaskTimelineSummary,
+  TimelineDocument,
+} from '../src/pipeline/types'
 import { fileExists, readJson, writeJson } from '../src/pipeline/utils'
 
 type RegressionCase = {
@@ -13,6 +18,7 @@ type RegressionCase = {
   label: string
   imagePath: string
   prompt: string
+  type?: string
 }
 
 type RegressionVersion = {
@@ -28,57 +34,6 @@ type RegressionVersion = {
 const projectRoot = process.cwd()
 const baselineWorktree = '/tmp/design2code-regression-baseline'
 
-const cases: RegressionCase[] = [
-  {
-    id: 'grouped-bar',
-    label: 'F2 Grouped Bar',
-    imagePath: path.resolve('test-inputs/attached-single-chart.png'),
-    prompt: '/svg/ F2 分组柱状图 interval grouped bar',
-  },
-  {
-    id: 'line-timeseries',
-    label: 'F2 Line',
-    imagePath: path.resolve('test-inputs/截屏2026-03-21 23.21.17.png'),
-    prompt: '/svg/ F2 折线图 line chart',
-  },
-  {
-    id: 'stacked-step',
-    label: 'F2 Stacked Combo',
-    imagePath: path.resolve('test-inputs/截屏2026-03-21 23.26.00.png'),
-    prompt: '/svg/ F2 组合图 stacked bar with dashed step line',
-  },
-  {
-    id: 'donut',
-    label: 'F2 Donut',
-    imagePath: path.resolve('test-inputs/截屏2026-03-22 00.55.21.png'),
-    prompt: '/svg/ F2 环形图 donut chart',
-  },
-  {
-    id: 'radar',
-    label: 'F2 Radar',
-    imagePath: path.resolve('test-inputs/截屏2026-03-22 00.56.15.png'),
-    prompt: '/svg/ F2 雷达图 radar chart',
-  },
-  {
-    id: 'area-fixture',
-    label: 'F2 Area',
-    imagePath: path.resolve('test-inputs/fixture-f2-area.png'),
-    prompt: '/svg/ F2 面积图 area chart',
-  },
-  {
-    id: 'scatter-fixture',
-    label: 'F2 Scatter',
-    imagePath: path.resolve('test-inputs/fixture-f2-scatter.png'),
-    prompt: '/svg/ F2 散点图 point scatter chart',
-  },
-  {
-    id: 'training-infographic',
-    label: 'Training Infographic',
-    imagePath: path.resolve('test-inputs/uploaded-training-infographic.png'),
-    prompt: '/svg/ 信息图 训练计划 卡片 infographic',
-  },
-]
-
 const versions: RegressionVersion[] = [
   {
     key: 'baseline-dom-svg',
@@ -89,8 +44,8 @@ const versions: RegressionVersion[] = [
     ref: 'iteration-qwen-ocr-chart-scene',
   },
   {
-    key: 'dom-svg-v3',
-    label: 'dom-svg-v3',
+    key: 'dom-svg-v4',
+    label: 'dom-svg-v4',
     versionTag: 'working-tree',
     branchKind: 'dom-svg',
     mode: 'current',
@@ -105,8 +60,26 @@ const versions: RegressionVersion[] = [
   },
 ]
 
+async function loadDataset(datasetPath: string) {
+  const dataset = await readJson<{
+    id: string
+    label: string
+    cases: RegressionCase[]
+  }>(datasetPath)
+
+  return {
+    id: dataset.id,
+    label: dataset.label,
+    cases: dataset.cases.map((entry) => ({
+      ...entry,
+      imagePath: path.resolve(entry.imagePath),
+    })),
+  }
+}
+
 function parseSelectedCaseIds() {
   const selected = new Set<string>()
+  let datasetPath = path.resolve('evals/datasets/core-regression.json')
   for (let index = 2; index < process.argv.length; index += 1) {
     const token = process.argv[index]
     if (token === '--case') {
@@ -116,8 +89,19 @@ function parseSelectedCaseIds() {
         index += 1
       }
     }
+
+    if (token === '--dataset') {
+      const customPath = process.argv[index + 1]
+      if (customPath) {
+        datasetPath = path.resolve(customPath)
+        index += 1
+      }
+    }
   }
-  return selected
+  return {
+    selected,
+    datasetPath,
+  }
 }
 
 async function ensureFixtureInputs() {
@@ -260,9 +244,10 @@ async function runBaselineVersion(version: RegressionVersion, testCase: Regressi
 }
 
 async function main() {
-  const selectedCaseIds = parseSelectedCaseIds()
+  const { selected, datasetPath } = parseSelectedCaseIds()
+  const dataset = await loadDataset(datasetPath)
   const activeCases =
-    selectedCaseIds.size > 0 ? cases.filter((entry) => selectedCaseIds.has(entry.id)) : cases
+    selected.size > 0 ? dataset.cases.filter((entry) => selected.has(entry.id)) : dataset.cases
 
   await ensureArtifactsLayout()
   await ensureFixtureInputs()
@@ -302,6 +287,70 @@ async function main() {
       2,
     ),
   )
+
+  const timeline = await readJson<TimelineDocument>(paths.timelinePath)
+  const commit = spawnSync('git', ['rev-parse', 'HEAD'], {
+    cwd: projectRoot,
+    encoding: 'utf8',
+  }).stdout.trim()
+  const currentTag = spawnSync('git', ['describe', '--tags', '--exact-match'], {
+    cwd: projectRoot,
+    encoding: 'utf8',
+  })
+  const runId = `eval-${new Date().toISOString().replace(/[:.]/g, '-')}`
+  const versionResults: EvaluationVersionResult[] = versions.map((version) => ({
+    versionLabel: version.label,
+    versionTag: version.versionTag,
+    branchKind: version.branchKind,
+    results: activeCases.map((testCase) => {
+      const task = timeline.tasks
+        .filter(
+          (entry) =>
+            entry.comparisonGroupId === `regression:${testCase.id}` &&
+            entry.versionLabel === version.label,
+        )
+        .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0]
+      const bestStage = task?.stages.find((stage) => stage.index === task.bestStageIndex) ?? task?.stages[0]
+
+      const failure = failures.find(
+        (entry) => entry.caseId === testCase.id && entry.version === version.label,
+      )
+
+      return {
+        caseId: testCase.id,
+        caseLabel: testCase.label,
+        imagePath: testCase.imagePath,
+        taskId: task?.taskId,
+        exitReason: task?.exitReason,
+        similarity: bestStage?.metrics?.visualSimilarity,
+        focusedSimilarity: bestStage?.metrics?.focusedVisualSimilarity,
+        structuralSimilarity: bestStage?.metrics?.structuralSimilarity,
+        chartShapeSimilarity: bestStage?.metrics?.chartShapeSimilarity,
+        criticalIssueCount: bestStage?.metrics?.criticalIssueCount,
+        overflowCount: bestStage?.metrics?.overflowCount,
+        occlusionCount: bestStage?.metrics?.occlusionCount,
+        metExpectation: task?.exitReason === 'success',
+        error: failure?.error,
+      }
+    }),
+  }))
+
+  const evaluationRun: EvaluationRun = {
+    runId,
+    createdAt: new Date().toISOString(),
+    datasetId: dataset.id,
+    datasetLabel: dataset.label,
+    commit,
+    tag: currentTag.status === 0 ? currentTag.stdout.trim() : undefined,
+    cases: activeCases.map((entry) => ({
+      caseId: entry.id,
+      caseLabel: entry.label,
+      imagePath: entry.imagePath,
+    })),
+    versions: versionResults,
+  }
+
+  await appendEvaluationRun(evaluationRun)
 }
 
 main().catch((error) => {

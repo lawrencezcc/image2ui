@@ -124,6 +124,10 @@ function renderNode(node: SceneNode) {
     return node.svg.replace('<svg', `<svg data-node-id="${node.id}" style="${baseStyle}"`)
   }
 
+  if (node.type === 'image' && node.asset?.src) {
+    return `<img data-node-id="${node.id}" src="/${node.asset.src}" alt="${escapeHtml(node.name ?? node.id)}" style="${baseStyle};object-fit:contain" />`
+  }
+
   if (node.text) {
     return `<div data-node-id="${node.id}" style="${baseStyle}">${escapeHtml(node.text.content)}</div>`
   }

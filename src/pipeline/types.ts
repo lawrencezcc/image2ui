@@ -104,6 +104,13 @@ export interface CanvasChartSpec {
   overlays?: CanvasChartOverlay[]
 }
 
+export interface SceneAsset {
+  src?: string
+  source: 'crop' | 'generated'
+  cacheKey?: string
+  prompt?: string
+}
+
 export interface SceneNode {
   id: string
   name?: string
@@ -126,6 +133,7 @@ export interface SceneNode {
     preserveAspectRatio?: string
   } | string
   canvas?: CanvasChartSpec
+  asset?: SceneAsset
   notes?: string
 }
 
@@ -244,6 +252,11 @@ export interface StageMetrics {
   pixelDiffRatio: number
   globalVisualSimilarity: number
   focusedVisualSimilarity: number
+  structuralSimilarity: number
+  foregroundIoU: number
+  edgeSimilarity: number
+  colorSimilarity: number
+  chartShapeSimilarity?: number
   activeRegionCoverage: number
   overflowCount: number
   occlusionCount: number
@@ -263,6 +276,38 @@ export interface StageDebugStats {
   overEditCount: number
   regressionCount: number
   newIssueCount: number
+  repairIntentCount: number
+  changedNodeCount: number
+  componentChanged: boolean
+  renderChanged: boolean
+  visualGain: number
+  focusedVisualGain: number
+  noOp: boolean
+}
+
+export interface TaskTraceSpan {
+  id: string
+  name: string
+  category: 'task' | 'ocr' | 'scene' | 'chart-spec' | 'render' | 'analyze' | 'repair' | 'asset' | 'eval'
+  stageIndex?: number
+  status: 'running' | 'completed' | 'failed'
+  startedAt: string
+  endedAt?: string
+  durationMs?: number
+  details?: Record<string, unknown>
+  error?: string
+}
+
+export interface TaskTraceSummary {
+  taskId: string
+  createdAt: string
+  updatedAt: string
+  status: 'running' | 'completed'
+  spanCount: number
+  eventCount: number
+  latestError?: string
+  totalDurationMs?: number
+  spans: TaskTraceSpan[]
 }
 
 export interface StageArtifact {
@@ -329,6 +374,13 @@ export interface TaskTimelineSummary {
   versionLabel?: string
   versionTag?: string
   branchKind?: 'dom-svg' | 'canvas' | 'adhoc'
+  trace?: {
+    path: string
+    spanCount: number
+    eventCount: number
+    totalDurationMs?: number
+    latestError?: string
+  }
   stages: TaskSummaryStage[]
 }
 
@@ -345,4 +397,43 @@ export interface TaskResult {
   stages: StageArtifact[]
   metExpectation: boolean
   reasons: string[]
+}
+
+export interface EvaluationCaseResult {
+  caseId: string
+  caseLabel: string
+  imagePath: string
+  taskId?: string
+  exitReason?: ExitReason
+  similarity?: number
+  focusedSimilarity?: number
+  structuralSimilarity?: number
+  chartShapeSimilarity?: number
+  criticalIssueCount?: number
+  overflowCount?: number
+  occlusionCount?: number
+  metExpectation?: boolean
+  error?: string
+}
+
+export interface EvaluationVersionResult {
+  versionLabel: string
+  versionTag: string
+  branchKind: 'dom-svg' | 'canvas'
+  results: EvaluationCaseResult[]
+}
+
+export interface EvaluationRun {
+  runId: string
+  createdAt: string
+  datasetId: string
+  datasetLabel: string
+  commit: string
+  tag?: string
+  cases: Array<{
+    caseId: string
+    caseLabel: string
+    imagePath: string
+  }>
+  versions: EvaluationVersionResult[]
 }

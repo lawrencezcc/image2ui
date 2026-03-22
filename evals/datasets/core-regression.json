@@ -1,0 +1,62 @@
+{
+  "id": "core-regression",
+  "label": "Core Design2Code Regression",
+  "cases": [
+    {
+      "id": "grouped-bar",
+      "label": "F2 Grouped Bar",
+      "imagePath": "test-inputs/attached-single-chart.png",
+      "prompt": "/svg/ F2 分组柱状图 interval grouped bar",
+      "type": "grouped-bar"
+    },
+    {
+      "id": "line-timeseries",
+      "label": "F2 Line",
+      "imagePath": "test-inputs/截屏2026-03-21 23.21.17.png",
+      "prompt": "/svg/ F2 折线图 line chart",
+      "type": "line"
+    },
+    {
+      "id": "stacked-step",
+      "label": "F2 Stacked Combo",
+      "imagePath": "test-inputs/截屏2026-03-21 23.26.00.png",
+      "prompt": "/svg/ F2 组合图 stacked bar with dashed step line",
+      "type": "combo"
+    },
+    {
+      "id": "donut",
+      "label": "F2 Donut",
+      "imagePath": "test-inputs/截屏2026-03-22 00.55.21.png",
+      "prompt": "/svg/ F2 环形图 donut chart",
+      "type": "donut"
+    },
+    {
+      "id": "radar",
+      "label": "F2 Radar",
+      "imagePath": "test-inputs/截屏2026-03-22 00.56.15.png",
+      "prompt": "/svg/ F2 雷达图 radar chart",
+      "type": "radar"
+    },
+    {
+      "id": "area-fixture",
+      "label": "F2 Area",
+      "imagePath": "test-inputs/fixture-f2-area.png",
+      "prompt": "/svg/ F2 面积图 area chart",
+      "type": "area"
+    },
+    {
+      "id": "scatter-fixture",
+      "label": "F2 Scatter",
+      "imagePath": "test-inputs/fixture-f2-scatter.png",
+      "prompt": "/svg/ F2 散点图 point scatter chart",
+      "type": "scatter"
+    },
+    {
+      "id": "training-infographic",
+      "label": "Training Infographic",
+      "imagePath": "test-inputs/uploaded-training-infographic.png",
+      "prompt": "/svg/ 信息图 训练计划 卡片 infographic",
+      "type": "infographic"
+    }
+  ]
+}

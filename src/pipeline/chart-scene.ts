@@ -1249,6 +1249,7 @@ export async function buildSceneFromChartSpec(options: {
       : inferCartesianPlotFrame(options.width, options.height, spec, options.words)
 
   spec = await resolveSeriesColors(spec, options.words, options.sampleImagePath, plot)
+  const canvasSpec = buildCanvasSpec(plot, spec)
 
   const chartNode: SceneNode =
     options.renderPreference === 'canvas'
@@ -1260,7 +1261,7 @@ export async function buildSceneFromChartSpec(options: {
           frame: plot,
           zIndex: 10,
           opacity: 1,
-          canvas: buildCanvasSpec(plot, spec),
+          canvas: canvasSpec,
           notes: `${spec.kind} chart rendered via canvas`,
         }
       : {
@@ -1272,6 +1273,7 @@ export async function buildSceneFromChartSpec(options: {
           zIndex: 10,
           opacity: 1,
           svg: buildSvgNode(plot, spec),
+          canvas: canvasSpec,
           notes: `${spec.kind} chart rendered via svg`,
         }
 

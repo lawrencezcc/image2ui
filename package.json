@@ -13,6 +13,8 @@
     "regression:run": "tsx scripts/run-regression.ts",
     "qwen:test": "tsx scripts/test-qwen-vl.ts",
     "qwen:ocr:test": "tsx scripts/test-qwen-ocr.ts",
+    "kimi:test": "tsx scripts/test-kimi.ts",
+    "version:sync": "tsx scripts/version-sync.ts",
     "playwright:install": "playwright install chromium"
   },
   "dependencies": {

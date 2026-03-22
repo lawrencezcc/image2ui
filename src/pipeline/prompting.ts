@@ -47,6 +47,8 @@ export function createScenePrompt(
   ocrHint?: string,
   promptText?: string,
 ) {
+  const semanticPrompt = stripRenderMarkers(promptText) ?? ''
+  const isInfographicPrompt = /(infographic|信息图|流程图|时间线|阶段卡片)/i.test(semanticPrompt)
   return `
 你是一个严格的视觉还原规划器。请根据附图输出 scene.json。
 
@@ -57,9 +59,10 @@ ${projectMemoryInstructions()}
 - v1 只复刻单个卡片或单个面板，不复刻整页拼贴图。
 - 输出精确的 artboard、节点、层级、文本盒子和约束。
 - 优先为图表、波形、几何形状选择 svg；只有明显需要时才选择 canvas。
+- 如果出现冠冕、箭头、照片、插画、复杂渐变徽章等不适合稳定用 svg/canvas 复刻的原子素材，允许输出 type="image" 的节点，后续会自动从原图裁剪为本地素材。
 - 所有数值使用像素单位，尽量避免猜测性描述。
 - 如果输入图包含多个卡片、多个界面或整页拼贴，请只选择最居中或最有代表性的单个卡片/面板来复刻。
-- 只提取高价值节点，不要穷举所有细碎装饰。优先识别 6 到 10 个最关键节点。
+- 只提取高价值节点，不要穷举所有细碎装饰。优先识别 ${isInfographicPrompt ? '10 到 16 个' : '6 到 10 个'} 最关键节点。
 
 渲染偏好：
 ${renderPreferenceInstructions(renderPreference, promptText)}
@@ -81,6 +84,7 @@ ${ocrHint}`
 - scene.source.height 使用 ${height}。
 - mode 固定为 "clone-static"。
 - nodes 必须覆盖被选中卡片/面板的主要可见元素，至少包含容器、标题、主要内容块、图表/图标和关键文本。
+- 对于信息图或复杂图文卡片，允许使用 image 节点承载少量复杂原子素材，但文本、容器和基础几何仍应尽量结构化表达。
 - 如果页面包含重复模块，允许把重复结构抽象成一个代表性模块，不必把每个重复元素都展开。
 - text 节点必须提供准确的文本盒子与字体参数。
 - constraints 至少包含：inside-parent、no-text-overflow 以及关键对齐约束。
