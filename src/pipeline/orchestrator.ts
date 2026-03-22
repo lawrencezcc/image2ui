@@ -11,6 +11,7 @@ import { kimiConfig, paths, pipelineDefaults } from './config'
 import { CodexCliClient } from './codex-client'
 import { computeDebugStats } from './debug-stats'
 import { buildFallbackComponent, isRenderableSfc } from './fallback'
+import { buildInfographicSceneFromOcr } from './infographic-scene'
 import { KimiCodingClient } from './kimi-client'
 import { createChartSpecPrompt, createRepairPrompt, createScenePrompt } from './prompting'
 import { QwenOcrClient } from './qwen-ocr-client'
@@ -1087,6 +1088,10 @@ function detectStageRenderMode(componentSource: string, scene: SceneDocument): R
 }
 
 function isChartLikeInput(promptText: string | undefined, ocrWords: Array<{ text: string }>) {
+  if (promptText && /(infographic|信息图|流程图|时间线|阶段卡片|训练计划)/i.test(promptText)) {
+    return false
+  }
+
   if (promptText && /(chart|graph|bar|line|area|pie|柱状图|折线图|面积图|图表|坐标轴)/i.test(promptText)) {
     return true
   }
@@ -1320,6 +1325,26 @@ export async function runTask(options: {
       ocrHint,
       options.promptText,
     )
+    const heuristicInfographicScene = buildInfographicSceneFromOcr({
+      imagePath: toPublicRelative(sourceCopyPath),
+      width,
+      height,
+      words: ocrWords,
+      promptText: options.promptText,
+    })
+
+    if (heuristicInfographicScene && isUsableScene(heuristicInfographicScene, renderPreference, options.promptText)) {
+      scene = heuristicInfographicScene
+      sceneResponseSummary = heuristicInfographicScene.summary ?? 'ocr-infographic-fallback'
+      await appendTrackedEvent({
+        type: 'scene_selected',
+        taskId,
+        provider: 'ocr-heuristic',
+        label: 'scene-infographic-fallback',
+        nodeCount: heuristicInfographicScene.nodes.length,
+      })
+      await syncTrace('running')
+    }
 
     if (isChartInput) {
       let chartSpecTraceId: string | undefined
@@ -1510,6 +1535,29 @@ export async function runTask(options: {
           provider: candidate.provider,
           label: candidate.label,
           error: error instanceof Error ? error.message : String(error),
+        })
+        await syncTrace('running')
+      }
+    }
+
+    if (!scene) {
+      const infographicScene = buildInfographicSceneFromOcr({
+        imagePath: toPublicRelative(sourceCopyPath),
+        width,
+        height,
+        words: ocrWords,
+        promptText: options.promptText,
+      })
+
+      if (infographicScene && isUsableScene(infographicScene, renderPreference, options.promptText)) {
+        scene = infographicScene
+        sceneResponseSummary = infographicScene.summary ?? 'ocr-infographic-fallback'
+        await appendTrackedEvent({
+          type: 'scene_selected',
+          taskId,
+          provider: 'ocr-heuristic',
+          label: 'scene-infographic-fallback',
+          nodeCount: infographicScene.nodes.length,
         })
         await syncTrace('running')
       }

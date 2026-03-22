@@ -8,6 +8,9 @@ function createSnapshotMap(stage: StageArtifact) {
 function actionScore(intent: RepairIntent, previous: StageArtifact, current: StageArtifact) {
   const previousNode = intent.nodeId ? createSnapshotMap(previous).get(intent.nodeId) : undefined
   const currentNode = intent.nodeId ? createSnapshotMap(current).get(intent.nodeId) : undefined
+  const renderChanged =
+    previous.render.renderHash !== current.render.renderHash ||
+    previous.render.layoutHash !== current.render.layoutHash
 
   if (intent.intentType === 'add_node') {
     return currentNode ? 1 : 0
@@ -46,6 +49,9 @@ function actionScore(intent: RepairIntent, previous: StageArtifact, current: Sta
       return currentNode.fontSize !== previousNode.fontSize || currentNode.lineHeight !== previousNode.lineHeight
         ? 1
         : 0
+    case 'change_color_style':
+    case 'change_chart_geometry':
+      return renderChanged ? 1 : 0
     default:
       return hashJson(currentNode.rect) !== hashJson(previousNode.rect) ? 1 : 0
   }

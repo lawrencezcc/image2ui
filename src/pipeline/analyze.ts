@@ -404,20 +404,39 @@ async function computeChartShapeSimilarity(
   referenceImagePath: string,
   candidateImagePath: string,
 ) {
-  const chartNode = scene.nodes.find((node) =>
+  const canvasChartNode = scene.nodes.find((node) =>
     Boolean(node.canvas && (node.canvas.kind === 'line' || node.canvas.kind === 'area')),
   )
+  const svgChartNode = scene.nodes.find(
+    (node) =>
+      node.render === 'svg' &&
+      typeof node.svg === 'string' &&
+      (node.svg.includes('<polyline') || node.svg.includes('<path')) &&
+      !node.svg.includes('<rect'),
+  )
 
-  if (!chartNode?.canvas) {
+  const chartNode = canvasChartNode ?? svgChartNode
+  if (!chartNode) {
+    return undefined
+  }
+
+  const seriesColors =
+    canvasChartNode?.canvas?.series.map((series) => series.color) ??
+    scene.nodes
+      .filter((node) => node.type === 'swatch')
+      .map((node) => node.style?.background ?? node.style?.fills?.[0])
+      .filter((value): value is string => Boolean(value))
+
+  if (!seriesColors.length) {
     return undefined
   }
 
   const referenceSampler = await loadRawImageSampler(referenceImagePath)
   const candidateSampler = await loadRawImageSampler(candidateImagePath)
-  const scores = chartNode.canvas.series
-    .map((series) => {
-      const referenceTrace = traceLineSeries(referenceSampler, chartNode.frame, series.color, 96)
-      const candidateTrace = traceLineSeries(candidateSampler, chartNode.frame, series.color, 96)
+  const scores = seriesColors
+    .map((color) => {
+      const referenceTrace = traceLineSeries(referenceSampler, chartNode.frame, color, 96)
+      const candidateTrace = traceLineSeries(candidateSampler, chartNode.frame, color, 96)
       return compareTraceSeries(referenceTrace, candidateTrace)
     })
     .filter((value): value is number => typeof value === 'number')
@@ -529,6 +548,33 @@ function buildIssue(
   }
 }
 
+function findPrimaryVisualNode(scene: SceneDocument) {
+  const chartNodes = scene.nodes
+    .filter(
+      (node) =>
+        node.canvas ||
+        node.type.includes('chart') ||
+        (node.render === 'svg' && (node.type === 'svg' || node.type === 'path')),
+    )
+    .sort(
+      (left, right) =>
+        right.frame.width * right.frame.height - left.frame.width * left.frame.height,
+    )
+
+  if (chartNodes.length) {
+    return chartNodes[0]
+  }
+
+  return (
+    [...scene.nodes]
+      .filter((node) => node.id !== 'card')
+      .sort(
+        (left, right) =>
+          right.frame.width * right.frame.height - left.frame.width * left.frame.height,
+      )[0] ?? scene.nodes[0]
+  )
+}
+
 function intentFromIssue(issue: RepairIssue): RepairIntent {
   switch (issue.type) {
     case 'missing_node':
@@ -574,6 +620,24 @@ function intentFromIssue(issue: RepairIssue): RepairIntent {
         nodeId: issue.nodeId,
         changeClass: 'modify',
         intentType: 'change_clip',
+        priority: issue.severity,
+        repair: issue.repair,
+      }
+    case 'color_mismatch':
+      return {
+        issueId: issue.issueId,
+        nodeId: issue.nodeId,
+        changeClass: 'modify',
+        intentType: 'change_color_style',
+        priority: issue.severity,
+        repair: issue.repair,
+      }
+    case 'chart_shape_mismatch':
+      return {
+        issueId: issue.issueId,
+        nodeId: issue.nodeId,
+        changeClass: 'modify',
+        intentType: 'change_chart_geometry',
         priority: issue.severity,
         repair: issue.repair,
       }
@@ -731,6 +795,7 @@ export async function analyzeStage(options: {
   const bboxErrors: number[] = []
   const snapshots = createSnapshotMap(options.render.nodes)
   const parentNodeIds = createChildNodeSet(options.scene)
+  const primaryVisualNode = findPrimaryVisualNode(options.scene)
 
   for (const node of options.scene.nodes) {
     const snapshot = snapshots.get(node.id)
@@ -858,6 +923,55 @@ export async function analyzeStage(options: {
 
   const constraintIssues = evaluateConstraints(options.scene.constraints, snapshots)
   issues.push(...constraintIssues)
+
+  if (
+    typeof chartShapeSimilarity === 'number' &&
+    chartShapeSimilarity < 0.82 &&
+    primaryVisualNode
+  ) {
+    issues.push(
+      buildIssue({
+        signature: `chart-shape:${primaryVisualNode.id}`,
+        nodeId: primaryVisualNode.id,
+        type: 'chart_shape_mismatch',
+        severity: chartShapeSimilarity < 0.6 ? 'critical' : 'high',
+        description: `图表主趋势与原图差异明显，当前图形相似度为 ${(chartShapeSimilarity * 100).toFixed(1)}%。`,
+        repair: `重新校正 ${primaryVisualNode.id} 的图表几何，优先修复折线/面积/雷达等主 marks 的走势、拐点、峰谷位置和相对波动幅度，使其更贴近原图。`,
+      }),
+    )
+  }
+
+  if (comparison.colorSimilarity < 0.82 && primaryVisualNode) {
+    issues.push(
+      buildIssue({
+        signature: `color-mismatch:${primaryVisualNode.id}`,
+        nodeId: primaryVisualNode.id,
+        type: 'color_mismatch',
+        severity: comparison.colorSimilarity < 0.7 ? 'high' : 'medium',
+        description: `关键前景颜色与原图存在明显色差，当前颜色相似度为 ${(comparison.colorSimilarity * 100).toFixed(1)}%。`,
+        repair: `重新校准 ${primaryVisualNode.id} 及相关图例/主图形的颜色，优先贴近原图的主色、辅助色和透明度，不要只保持语义接近。`,
+      }),
+    )
+  }
+
+  if (
+    issues.length === 0 &&
+    (comparison.structuralSimilarity < 0.78 || comparison.focusedVisualSimilarity < 0.9)
+  ) {
+    issues.push(
+      buildIssue({
+        signature: `visual-mismatch:${primaryVisualNode?.id ?? 'artboard'}`,
+        nodeId: primaryVisualNode?.id,
+        type: 'visual_mismatch',
+        severity:
+          comparison.structuralSimilarity < 0.68 || comparison.focusedVisualSimilarity < 0.84
+            ? 'high'
+            : 'medium',
+        description: `虽然节点级约束基本满足，但整体视觉结构仍与原图不一致。当前结构相似度 ${(comparison.structuralSimilarity * 100).toFixed(1)}%，聚焦相似度 ${(comparison.focusedVisualSimilarity * 100).toFixed(1)}%。`,
+        repair: `保持已正确的文本与布局节点不变，重点调整 ${primaryVisualNode?.id ?? '主要内容区域'} 的局部几何、间距、线条或留白，使整体视觉结构更贴近原图。`,
+      }),
+    )
+  }
 
   const metrics: StageMetrics = {
     visualSimilarity:

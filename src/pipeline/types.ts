@@ -214,6 +214,9 @@ export interface RepairIssue {
     | 'occluded'
     | 'misaligned'
     | 'layout_overflow'
+    | 'color_mismatch'
+    | 'chart_shape_mismatch'
+    | 'visual_mismatch'
   severity: Severity
   description: string
   repair: string
@@ -234,6 +237,8 @@ export interface RepairIntent {
     | 'change_z_index'
     | 'change_alignment'
     | 'change_clip'
+    | 'change_color_style'
+    | 'change_chart_geometry'
   priority: Severity
   direction?: 'left' | 'right' | 'up' | 'down' | 'expand' | 'shrink'
   expectedDelta?: Partial<Record<'x' | 'y' | 'width' | 'height' | 'zIndex', number>>

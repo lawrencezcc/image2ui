@@ -114,13 +114,27 @@ function normalizeWords(content: OcrContentItem[] | undefined) {
     }))
     .filter((word) => word.text)
 
-  if (explicitWords.length > 0) {
+  const explicitHasUsableLocation = explicitWords.some((word) =>
+    Array.isArray(word.location) ? word.location.some((value) => Math.abs(value) > 0.5) : false,
+  )
+
+  if (explicitWords.length > 0 && explicitHasUsableLocation) {
     return explicitWords
   }
 
-  return (content ?? [])
+  const embeddedWords = (content ?? [])
     .flatMap((item) => parseEmbeddedWords(item.text))
     .filter((word) => word.text)
+
+  const embeddedHasUsableLocation = embeddedWords.some((word) =>
+    Array.isArray(word.location) ? word.location.some((value) => Math.abs(value) > 0.5) : false,
+  )
+
+  if (embeddedWords.length > 0 && embeddedHasUsableLocation) {
+    return embeddedWords
+  }
+
+  return explicitWords.length > 0 ? explicitWords : embeddedWords
 }
 
 function rotateRectToLocation(rotateRect: number[]) {

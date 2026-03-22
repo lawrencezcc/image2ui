@@ -156,7 +156,7 @@ ${ocrHint}`
       "data": [],
       "points": [{ "x": 0.0, "y": 0.0 }],
       "areaOpacity": 0.18,
-      "lineDash": [8, 6]
+      "lineDash": []
     }
   ],
   "legend": {
@@ -169,6 +169,7 @@ ${ocrHint}`
 硬性要求：
 - 所有颜色使用十六进制。
 - 如果是常规柱状图/折线图/面积图，series.data 长度必须和 xAxis.categories 长度一致。
+- 只有图中确实出现虚线、点划线、台阶虚线时才填写 lineDash；普通实线请传空数组或省略。
 - 如果是饼图/环形图，每个 series.data 只保留一个值。
 - points 中的 x / y 采用 0 到 1 的归一化坐标，表示相对 plot 区域的位置。
 - 如果图中没有 title，title 为空字符串。

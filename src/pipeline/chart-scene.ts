@@ -332,6 +332,34 @@ function resolveKind(spec: ChartSpec, promptText?: string) {
   const prompt = (promptText ?? '').toLowerCase()
   const categories = spec.xAxis?.categories ?? []
 
+  if (/雷达|radar/.test(prompt)) {
+    return 'radar'
+  }
+
+  if (/面积|area/.test(prompt)) {
+    return 'area'
+  }
+
+  if (/折线|line/.test(prompt)) {
+    return 'line'
+  }
+
+  if (/散点|scatter|point/.test(prompt)) {
+    return 'scatter'
+  }
+
+  if (/环形|donut|ring/.test(prompt)) {
+    return 'donut'
+  }
+
+  if (/饼图|pie/.test(prompt)) {
+    return 'pie'
+  }
+
+  if (/柱状|bar|interval|column/.test(prompt)) {
+    return spec.plotHint?.stacked || categories.every((category) => !category.trim()) ? 'stacked-bar' : 'grouped-bar'
+  }
+
   if (subtype.includes('donut') || /环形|donut|ring/.test(prompt)) {
     return 'donut'
   }
@@ -393,13 +421,14 @@ function normalizeSeries(spec: ChartSpec): NormalizedChartSeries[] {
 }
 
 function normalizeChartSpec(spec: ChartSpec, promptText?: string): NormalizedChartSpec | undefined {
-  const series = normalizeSeries(spec)
-  if (!series.length) {
+  const rawSeries = normalizeSeries(spec)
+  const prompt = (promptText ?? '').toLowerCase()
+  if (!rawSeries.length) {
     return undefined
   }
 
   const categories = spec.xAxis?.categories?.map((value) => String(value)) ?? []
-  const flatValues = series.flatMap((entry) => entry.data).filter((value) => Number.isFinite(value))
+  const flatValues = rawSeries.flatMap((entry) => entry.data).filter((value) => Number.isFinite(value))
   const min = Number.isFinite(spec.yAxis?.min) ? Number(spec.yAxis?.min) : Math.min(0, ...flatValues, 0)
   const max = Number.isFinite(spec.yAxis?.max) ? Number(spec.yAxis?.max) : Math.max(...flatValues, 100)
   const step =
@@ -407,6 +436,18 @@ function normalizeChartSpec(spec: ChartSpec, promptText?: string): NormalizedCha
       ? Number(spec.yAxis?.step)
       : Math.max(10, Math.round((max - min || 100) / 4 / 10) * 10)
   const kind = resolveKind(spec, promptText)
+  const keepDashedSeries =
+    Boolean(spec.plotHint?.stepLine) || /虚线|dash|dashed|step/.test(prompt)
+  const series =
+    kind === 'line' || kind === 'area' || kind === 'scatter' || kind === 'radar'
+      ? rawSeries.map((entry) => ({
+          ...entry,
+          lineDash:
+            keepDashedSeries || (entry.lineDash?.join(',') ?? '') !== '8,6'
+              ? entry.lineDash
+              : undefined,
+        }))
+      : rawSeries
   const overlays: CanvasChartOverlay[] = []
 
   if (kind === 'stacked-bar' && series.length >= 2) {
