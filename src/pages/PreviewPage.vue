@@ -104,8 +104,13 @@ const tasks = computed(() => {
     }
   }
 
-  return [...deduped.values()].reverse()
+  return [...deduped.values()].sort(
+    (left, right) =>
+      new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime(),
+  )
 })
+
+const latestTaskId = computed(() => tasks.value[0]?.taskId ?? '')
 
 function versionOrder(task: TaskTimelineItem) {
   const label = (task.versionLabel ?? '').toLowerCase()
@@ -140,17 +145,23 @@ const taskGroups = computed<TaskGroup[]>(() => {
     })
   }
 
-  return [...groups.values()].map((group) => ({
-    ...group,
-    tasks: [...group.tasks].sort((left, right) => {
-      const versionDelta = versionOrder(left) - versionOrder(right)
-      if (versionDelta !== 0) {
-        return versionDelta
-      }
+  return [...groups.values()]
+    .map((group) => ({
+      ...group,
+      tasks: [...group.tasks].sort((left, right) => {
+        const versionDelta = versionOrder(left) - versionOrder(right)
+        if (versionDelta !== 0) {
+          return versionDelta
+        }
 
-      return new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime()
-    }),
-  }))
+        return new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime()
+      }),
+    }))
+    .sort((left, right) => {
+      const leftLatest = Math.max(...left.tasks.map((task) => new Date(task.createdAt).getTime()))
+      const rightLatest = Math.max(...right.tasks.map((task) => new Date(task.createdAt).getTime()))
+      return rightLatest - leftLatest
+    })
 })
 
 function ensureExpandedTaskState() {
@@ -161,6 +172,11 @@ function ensureExpandedTaskState() {
   if (runningTask && !known.has(runningTask.taskId)) {
     next.unshift(runningTask.taskId)
   }
+
+   const latestTask = tasks.value[0]
+   if (latestTask && !known.has(latestTask.taskId)) {
+     next.unshift(latestTask.taskId)
+   }
 
   const latestTaskWithStages = tasks.value.find((task) => task.stages.length > 0)
   if (!next.length && latestTaskWithStages) {
@@ -314,6 +330,12 @@ watch(tasks, () => {
             <button class="task-toggle" type="button" @click="toggleTask(task.taskId)">
               <aside class="task-meta">
                 <div class="task-badges">
+                  <span
+                    v-if="task.taskId === latestTaskId"
+                    class="task-badge task-badge--latest"
+                  >
+                    最新任务
+                  </span>
                   <span v-if="task.versionLabel" class="task-badge task-badge--version">{{ task.versionLabel }}</span>
                   <span v-if="task.branchKind" class="task-badge">{{ task.branchKind }}</span>
                   <span v-if="task.versionTag" class="task-badge">{{ task.versionTag }}</span>
@@ -341,6 +363,29 @@ watch(tasks, () => {
                 <figcaption>
                   <strong>原图</strong>
                   <span>{{ task.caseLabel ?? '输入设计图' }}</span>
+                </figcaption>
+              </figure>
+
+              <figure
+                v-if="task.status === 'completed' && !task.stages.length"
+                class="stage-card stage-card--running"
+              >
+                <div class="stage-placeholder" aria-hidden="true">
+                  <div class="stage-placeholder-bar"></div>
+                  <div class="stage-placeholder-bar stage-placeholder-bar--short"></div>
+                  <div class="stage-placeholder-grid">
+                    <span v-for="index in 6" :key="index" class="stage-placeholder-dot"></span>
+                  </div>
+                </div>
+                <figcaption>
+                  <strong>未产出阶段图</strong>
+                  <span>任务已结束：{{ task.exitReason ?? 'unknown' }}</span>
+                  <small>
+                    这是最新任务，但在首个阶段截图前就失败了，因此这里保留占位以显性提示。
+                  </small>
+                  <small v-if="task.trace">
+                    Trace：{{ task.trace.spanCount }} spans · {{ task.trace.eventCount }} events
+                  </small>
                 </figcaption>
               </figure>
 
