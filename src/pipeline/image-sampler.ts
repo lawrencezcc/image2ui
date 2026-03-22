@@ -226,7 +226,7 @@ export function traceLineSeries(
     const medianY = matches[Math.floor(matches.length / 2)] ?? matches[0]
     points.push({
       x: ratio,
-      y: (medianY - normalized.y) / normalized.height,
+      y: 1 - (medianY - normalized.y) / normalized.height,
     })
   }
 

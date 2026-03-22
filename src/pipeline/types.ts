@@ -216,6 +216,7 @@ export interface RepairIssue {
     | 'layout_overflow'
     | 'color_mismatch'
     | 'chart_shape_mismatch'
+    | 'stage_regression'
     | 'visual_mismatch'
   severity: Severity
   description: string
@@ -262,6 +263,10 @@ export interface StageMetrics {
   edgeSimilarity: number
   colorSimilarity: number
   chartShapeSimilarity?: number
+  previousStageVisualSimilarity?: number
+  previousStageStructuralSimilarity?: number
+  previousStageColorSimilarity?: number
+  previousStageChartShapeSimilarity?: number
   activeRegionCoverage: number
   overflowCount: number
   occlusionCount: number

@@ -12,35 +12,35 @@
     {
       "id": "line-timeseries",
       "label": "F2 Line",
-      "imagePath": "test-inputs/截屏2026-03-21 23.21.17.png",
+      "imagePath": "test-inputs/fixture-f2-line.png",
       "prompt": "/svg/ F2 折线图 line chart",
       "type": "line"
     },
     {
       "id": "stacked-step",
       "label": "F2 Stacked Combo",
-      "imagePath": "test-inputs/截屏2026-03-21 23.26.00.png",
+      "imagePath": "test-inputs/fixture-f2-stacked-step.png",
       "prompt": "/svg/ F2 组合图 stacked bar with dashed step line",
       "type": "combo"
     },
     {
       "id": "donut",
       "label": "F2 Donut",
-      "imagePath": "test-inputs/截屏2026-03-22 00.55.21.png",
+      "imagePath": "test-inputs/fixture-f2-donut.png",
       "prompt": "/svg/ F2 环形图 donut chart",
       "type": "donut"
     },
     {
       "id": "donut-side-legend",
       "label": "F2 Donut Side Legend",
-      "imagePath": "test-inputs/截屏2026-03-22 20.26.15.png",
+      "imagePath": "test-inputs/fixture-f2-donut-side-legend.png",
       "prompt": "/svg/ F2 环形图 donut chart side legend",
       "type": "donut"
     },
     {
       "id": "radar",
       "label": "F2 Radar",
-      "imagePath": "test-inputs/截屏2026-03-22 00.56.15.png",
+      "imagePath": "test-inputs/fixture-f2-radar.png",
       "prompt": "/svg/ F2 雷达图 radar chart",
       "type": "radar"
     },
@@ -61,8 +61,15 @@
     {
       "id": "training-infographic",
       "label": "Training Infographic",
-      "imagePath": "test-inputs/uploaded-training-infographic.png",
+      "imagePath": "test-inputs/fixture-infographic-timeline.png",
       "prompt": "/svg/ 信息图 训练计划 卡片 infographic",
+      "type": "infographic"
+    },
+    {
+      "id": "multi-card-infographic",
+      "label": "Multi Card Infographic",
+      "imagePath": "test-inputs/fixture-infographic-multi-card.jpg",
+      "prompt": "/svg/ 信息图 多卡片 运营数据 infographic",
       "type": "infographic"
     }
   ]

@@ -233,7 +233,7 @@ ${projectMemoryInstructions()}
 
 修复目标：
 - 先处理 critical/high 问题。
-- 优先解决：文字溢出、遮挡、错位、对齐、层级。
+- 优先解决：文字溢出、遮挡、错位、对齐、层级，以及走势翻转、系列错位等阶段性回归问题。
 - 如果某个节点适合从 html 改为 svg，可以这样做，但保留原 node id。
 - 如果某个节点是 canvas 图表节点，允许继续使用 <canvas> 绘制并只修复对应绘图逻辑，不要擅自退回空容器。
 - 如果本轮结果不如历史最佳，请参考 best-stage 的结构，不要继续在错误方向上放大偏差。
@@ -384,7 +384,7 @@ export function createCompactRepairPrompt(
 ${projectMemoryInstructions()}
 
 修复策略：
-- 优先处理 chart_shape_mismatch、color_mismatch、occluded、text_overflow。
+- 优先处理 chart_shape_mismatch、stage_regression、color_mismatch、occluded、text_overflow。
 - 只改问题节点及其必要父节点；保持所有 data-node-id 稳定。
 - 当前渲染偏好：${renderPreference}。
 - 如果是折线图、面积图、雷达图或 canvas 图表，优先修几何走势、颜色和图例，不要改动无关布局。
@@ -401,6 +401,10 @@ ${JSON.stringify(
       structuralSimilarity: stage.metrics.structuralSimilarity,
       colorSimilarity: stage.metrics.colorSimilarity,
       chartShapeSimilarity: stage.metrics.chartShapeSimilarity,
+      previousStageVisualSimilarity: stage.metrics.previousStageVisualSimilarity,
+      previousStageStructuralSimilarity: stage.metrics.previousStageStructuralSimilarity,
+      previousStageColorSimilarity: stage.metrics.previousStageColorSimilarity,
+      previousStageChartShapeSimilarity: stage.metrics.previousStageChartShapeSimilarity,
       overflowCount: stage.metrics.overflowCount,
       occlusionCount: stage.metrics.occlusionCount,
       criticalIssueCount: stage.metrics.criticalIssueCount,

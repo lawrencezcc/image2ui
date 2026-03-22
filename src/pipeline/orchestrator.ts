@@ -1109,7 +1109,7 @@ function shouldUseCompactRepair(
   }
 
   const geometrySensitiveIssues = stage.repairReport.issues.some((issue) =>
-    ['chart_shape_mismatch', 'color_mismatch', 'visual_mismatch'].includes(issue.type),
+    ['chart_shape_mismatch', 'stage_regression', 'color_mismatch', 'visual_mismatch'].includes(issue.type),
   )
 
   const chartNode = scene.nodes.find((node) => node.render === 'canvas' || node.render === 'svg')
@@ -1137,7 +1137,7 @@ function shouldUseKimiRepairFallback(
 
   if (
     stage.repairReport.issues.some((issue) =>
-      ['chart_shape_mismatch', 'visual_mismatch'].includes(issue.type),
+      ['chart_shape_mismatch', 'stage_regression', 'visual_mismatch'].includes(issue.type),
     )
   ) {
     return true
@@ -1836,6 +1836,7 @@ export async function runTask(options: {
         diffTargetPath,
         diffPrevPath,
         previousScreenshotPath: latestStage?.screenshotPath,
+        previousMetrics: latestStage?.metrics,
       })
       traceRecorder.finish(analyzeTraceId, 'completed', {
         details: {

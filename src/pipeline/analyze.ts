@@ -633,6 +633,7 @@ function intentFromIssue(issue: RepairIssue): RepairIntent {
         repair: issue.repair,
       }
     case 'chart_shape_mismatch':
+    case 'stage_regression':
       return {
         issueId: issue.issueId,
         nodeId: issue.nodeId,
@@ -774,6 +775,7 @@ export async function analyzeStage(options: {
   diffTargetPath: string
   diffPrevPath?: string
   previousScreenshotPath?: string
+  previousMetrics?: StageMetrics
 }) {
   const comparison = await compareImages(
     options.referenceImagePath,
@@ -781,8 +783,21 @@ export async function analyzeStage(options: {
     options.diffTargetPath,
   )
 
+  let previousComparison:
+    | Awaited<ReturnType<typeof compareImages>>
+    | undefined
+  let previousChartShapeSimilarity: number | undefined
   if (options.diffPrevPath && options.previousScreenshotPath) {
-    await compareImages(options.previousScreenshotPath, options.render.screenshotPath, options.diffPrevPath)
+    previousComparison = await compareImages(
+      options.previousScreenshotPath,
+      options.render.screenshotPath,
+      options.diffPrevPath,
+    )
+    previousChartShapeSimilarity = await computeChartShapeSimilarity(
+      options.scene,
+      options.previousScreenshotPath,
+      options.render.screenshotPath,
+    )
   }
 
   const chartShapeSimilarity = await computeChartShapeSimilarity(
@@ -941,6 +956,38 @@ export async function analyzeStage(options: {
     )
   }
 
+  if (
+    previousComparison &&
+    options.previousMetrics &&
+    primaryVisualNode &&
+    comparison.visualSimilarity <= options.previousMetrics.visualSimilarity + 0.002 &&
+    previousComparison.structuralSimilarity < 0.78 &&
+    (
+      typeof previousChartShapeSimilarity !== 'number' ||
+      previousChartShapeSimilarity < 0.62
+    )
+  ) {
+    issues.push(
+      buildIssue({
+        signature: `stage-regression:${primaryVisualNode.id}:${Math.round(previousComparison.structuralSimilarity * 100)}`,
+        nodeId: primaryVisualNode.id,
+        type: 'stage_regression',
+        severity:
+          previousComparison.structuralSimilarity < 0.6 ||
+          (typeof previousChartShapeSimilarity === 'number' && previousChartShapeSimilarity < 0.45)
+            ? 'critical'
+            : 'high',
+        description:
+          `与上一阶段相比，主视觉结构变化过大但目标相似度没有提升。当前对上一阶段的结构相似度 ${(previousComparison.structuralSimilarity * 100).toFixed(1)}%` +
+          (typeof previousChartShapeSimilarity === 'number'
+            ? `，走势相似度 ${(previousChartShapeSimilarity * 100).toFixed(1)}%。`
+            : '。'),
+        repair:
+          `避免继续沿错误方向漂移，重新校正 ${primaryVisualNode.id} 的主图形布局与走势；若本轮变更导致趋势翻转、系列错位或局部镜像，优先回退到更接近上一阶段且更接近原图的几何。`,
+      }),
+    )
+  }
+
   if (comparison.colorSimilarity < 0.82 && primaryVisualNode) {
     issues.push(
       buildIssue({
@@ -986,6 +1033,10 @@ export async function analyzeStage(options: {
     edgeSimilarity: comparison.edgeSimilarity,
     colorSimilarity: comparison.colorSimilarity,
     chartShapeSimilarity,
+    previousStageVisualSimilarity: previousComparison?.visualSimilarity,
+    previousStageStructuralSimilarity: previousComparison?.structuralSimilarity,
+    previousStageColorSimilarity: previousComparison?.colorSimilarity,
+    previousStageChartShapeSimilarity: previousChartShapeSimilarity,
     activeRegionCoverage: comparison.activeRegionCoverage,
     overflowCount: issues.filter((issue) => issue.type === 'text_overflow').length,
     occlusionCount: issues.filter((issue) => issue.type === 'occluded').length,

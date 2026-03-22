@@ -18,6 +18,10 @@ type StageTimelineItem = {
     structuralSimilarity?: number
     colorSimilarity?: number
     chartShapeSimilarity?: number
+    previousStageVisualSimilarity?: number
+    previousStageStructuralSimilarity?: number
+    previousStageColorSimilarity?: number
+    previousStageChartShapeSimilarity?: number
     overflowCount: number
     occlusionCount: number
     criticalIssueCount: number
@@ -426,6 +430,11 @@ watch(tasks, () => {
                       结构 {{ formatRate(stage.metrics?.structuralSimilarity) }} ·
                       颜色 {{ formatRate(stage.metrics?.colorSimilarity) }} ·
                       走势 {{ formatRate(stage.metrics?.chartShapeSimilarity) }}
+                    </small>
+                    <small v-if="typeof stage.metrics?.previousStageVisualSimilarity === 'number'">
+                      对上一阶段：结构 {{ formatRate(stage.metrics?.previousStageStructuralSimilarity) }} ·
+                      颜色 {{ formatRate(stage.metrics?.previousStageColorSimilarity) }} ·
+                      走势 {{ formatRate(stage.metrics?.previousStageChartShapeSimilarity) }}
                     </small>
                     <small>{{ formatRenderMode(stage) }}</small>
                     <small>
